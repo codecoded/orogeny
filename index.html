@@ -38,20 +38,25 @@
 <script>
 'use strict';
 /*
-  OROGENY — a world you can hold.
+  OROGENY — a world you can hold, and its whole history.
 
-  Raise land from the sea of a small planet. Wind, rain, rivers, ice and time do the rest, and
-  after a while something starts lighting fires on the night side.
+  Push land up out of the sea of a small planet and it comes as fire. Wind, rain, rivers, tides,
+  ice and time do the rest. After a while something lights fires on the night side; the fires
+  become towns, the towns wear roads between them, and one day a spark leaves for the moon.
 
   The whole planet is one square texture folded onto a sphere. Per cell: bedrock height, water
-  depth, suspended sediment, vegetation, ice, soil moisture, people.
-    sim      flux → flow → erode    shallow water in "virtual pipes", sediment, talus
-    life     ice, soil moisture, settlement
+  depth, suspended sediment, vegetation, ice, soil moisture, people, lava, and the way to town.
+    sim      flux → flow → erode    shallow water in "virtual pipes", tides, sediment, talus
+    lava     a second, slower fluid on the same grid, which freezes into bedrock
+    life     ice, soil moisture, settlement, and the roads that traffic wears
     weather  moisture carried on the winds; cloud and rain wherever air is made to rise
     derive   filterable copies with normals; sun shadows and occlusion marched in map space
     air      single scattering through the atmosphere, at a third of the picture's size
-    render   one march against the displaced sphere, the cloud layer, aurora; then bloom and grade
+    render   one march against the displaced sphere, the cloud layer, aurora, a moon; then bloom and grade
     sound    a few pixels read back from the GPU drive a synthesised score
+  One rule is used four times over: a cell hands something to a lower neighbour. Water does it
+  with momentum, rock when it overhangs, lava while it is hot, and travellers down a field of
+  tolls, which is why the roads come out looking like rivers.
   Stand far back and time runs fast. Come close and it slows to an afternoon.
 */
 
@@ -169,12 +174,14 @@ const R = .3 * N;                      // planet radius, chosen so that a cell i
 const ZS = N > 512 ? .5 : .35;         // how tall a unit of simulated height is drawn
 const HMAX = 60;                       // no land or water stands higher than this
 const NEAR = R + ZS * HMAX + 8, FARD = 6 * R;   // the camera's range: from just clear of the highest peak, out to where the planet is small
+const MOON_R = .3, MOON_D = 6.6 * R, TIDE = .32; // the moon: its radius (in planet radii), its distance (beyond the camera's reach), its pull on the sea
 
 // ───────────────────────────────────────────────────────────── shaders
 const HEAD = LEAN + `
 const float N = ${N}., NW = ${NW}., R = ${R.toFixed(1)}, ZS = ${ZS}, HMAX = ${HMAX}., FAR = 6e4;
 const int M = ${N - 1}, MW = ${NW - 1};
 uniform float uTime, uSea, uWarm; uniform vec3 uSeed;
+uniform vec4 uTide;                    // the way to the moon, and how high it lifts the sea beneath it
 
 // The surface lives in square textures through an octahedral map: fold a square into an
 // octahedron, inflate that into a sphere. One texture covers the globe with no poles to pinch.
@@ -189,6 +196,7 @@ vec2 encode(vec3 n){
   n /= abs(n.x)+abs(n.y)+abs(n.z);
   return (n.y>=0. ? n.xz : (1.-abs(n.zx))*sgn(n.xz))*.5+.5;
 }
+const ivec2 RING[8] = ivec2[8](ivec2(-1,0), ivec2(1,0), ivec2(0,1), ivec2(0,-1), ivec2(-1,-1), ivec2(1,1), ivec2(1,-1), ivec2(-1,1));   // a cell's neighbours, each followed by its opposite
 ivec2 wrap(ivec2 q, int m){            // a cell index that has stepped off the square comes back in, mirrored
   if(q.x<0 || q.x>m) q = ivec2(clamp(q.x, 0, m), m-q.y);
   if(q.y<0 || q.y>m) q = ivec2(m-q.x, clamp(q.y, 0, m));
@@ -200,6 +208,12 @@ vec2 gut(vec3 n, float size){ return (encode(n)*size+1.)/(size+2.); }
 
 // Warm at the equator, cold at the poles and on the heights. Above zero, water is liquid.
 float temperature(vec3 n, float b){ return uWarm-1.5*n.y*n.y-.022*max(b-uSea, 0.); }
+// The moon draws the sea into two bulges, one beneath it and one opposite, and drags them round
+// the planet. This is the height the sea would settle at, relative to its mean level.
+float tide(vec3 n){ float c = dot(n, uTide.xyz); return uTide.w*(1.5*c*c-.5); }
+// Lava is (depth, heat, when it last ran). This much of a flow turns to rock in one tick of its
+// clock: a little all the time, which builds levees and cones, and all of it once it has cooled.
+float frozen(vec4 l, float tick){ return l.x<.004 ? l.x : l.x*min(tick*(.0015+.25*(1.-smoothstep(.05, .25, l.y))), 1.); }
 
 // One value-noise function is the only source of randomness: it shapes the continents, the rock,
 // the uplift under the hand, the weather, the ripples, the foam, the canopy and the stars.
@@ -255,11 +269,12 @@ void main(){
 // to the difference in surface height. Flux persists between steps, which is the water's inertia.
 SIM.flux = `
 uniform sampler2D uS, uF; out vec4 o;
-float top(ivec2 q){ vec4 c = texelFetch(uS, wrap(q, M), 0); return c.x+c.y; }
+// The surface that water runs down is its own height less the tide, so the moon's pull moves it too.
+float top(ivec2 q){ q = wrap(q, M); vec4 c = texelFetch(uS, q, 0); return c.x+c.y-tide(decode((vec2(q)+.5)/N)); }
 void main(){
   ivec2 p = ivec2(gl_FragCoord.xy);
   vec4 c = texelFetch(uS, p, 0);
-  vec4 fall = c.x+c.y - vec4(top(p+ivec2(-1,0)), top(p+ivec2(1,0)), top(p+ivec2(0,1)), top(p+ivec2(0,-1)));
+  vec4 fall = top(p) - vec4(top(p+ivec2(-1,0)), top(p+ivec2(1,0)), top(p+ivec2(0,1)), top(p+ivec2(0,-1)));
   float g = min(.07, .2/max(c.y, 1e-4));       // cap the wave speed sqrt(g·depth) so deep water stays stable
   vec4 f = max(vec4(0.), texelFetch(uF, p, 0)*.996 + g*fall);
   o = f*min(1., c.y/(f.x+f.y+f.z+f.w+1e-9));   // never drain more water than the cell holds
@@ -285,7 +300,7 @@ void main(){
 }`;
 
 SIM.erode = `
-uniform sampler2D uS, uV, uC, uRock, uLen, uW; uniform vec4 uBrush; uniform float uBrushR, uRain; out vec4 o;
+uniform sampler2D uS, uV, uC, uRock, uLen, uW, uL; uniform vec4 uBrush; uniform float uBrushR, uRain, uTick; out vec4 o;
 vec4 S(ivec2 q){ return texelFetch(uS, wrap(q, M), 0); }
 void main(){
   ivec2 p = ivec2(gl_FragCoord.xy); vec3 n = decode(gl_FragCoord.xy/N);
@@ -317,30 +332,63 @@ void main(){
 
   // The viewer's hand. Uplift follows ridged noise so that land rises as ranges, not bells.
   float g = exp(-2.*R*R*(1.-dot(n, uBrush.xyz))/(uBrushR*uBrushR))*uBrush.w;
-  b += g>0. ? g*(.15+2.2*rock.y)*(1.-smoothstep(36., 52., b)) : g*(.6+.8*rock.w)*smoothstep(-14., -10., b);
+  b += g>0. ? g*(.13+1.9*rock.y)*(1.-smoothstep(36., 52., b)) : g*(.6+.8*rock.w)*smoothstep(-14., -10., b);
   veg *= 1.-min(abs(g)*2., 1.);
+  if(uTick>0.){                                      // the lava pass is about to freeze some of its flow: here it becomes ground
+    vec4 lava = texelFetch(uL, p, 0);
+    b += frozen(lava, uTick); veg *= 1.-smoothstep(0., .05, lava.x); d = max(d-.02*lava.x*lava.y, 0.);   // and it burns, and boils
+  }
 
   // Rain where the weather says so, if it is warm enough to fall as rain; meltwater from the ice.
-  if(b>uSea && T>0.) d += uRain*textureLod(uW, gut(n, NW), 0.).g+min(ice, .0015*T);
-  if(b<uSea-.3 && d>0.) d += .0015*(uSea-b-d);                               // the open ocean finds its level
-  else if(b+d>uSea+.35) d = max(d*(1.-.0012*(.4+max(T, 0.)))-.00012, 0.);   // standing water evaporates, faster where it is hot, and soaks away
+  float sea = uSea+tide(n);
+  if(b>sea && T>0.) d += uRain*textureLod(uW, gut(n, NW), 0.).g+min(ice, .0015*T);
+  if(b<sea-.3 && d>0.) d += .0015*(sea-b-d);                                 // the open ocean finds its level, which the tide keeps moving
+  else if(b+d>sea+.35) d = max(d*(1.-.0012*(.4+max(T, 0.)))-.00012, 0.);    // standing water evaporates, faster where it is hot, and soaks away
 
   // Vegetation spreads from where it already is, as far as soil moisture and warmth allow.
   float around = max(max(l.w, r.w), max(u.w, dn.w));
   float fertile = smoothstep(.08, .45, life.z)*smoothstep(-.02, .22, T);
-  float suit = step(d, .08)*step(ice, .05)*smoothstep(.3, 1.6, b-uSea)*(1.-smoothstep(.4, .95, slope))*(.35+.65*rock.w);
+  float suit = step(d, .08)*step(ice, .05)*smoothstep(.1, 1.3, b-uSea-uTide.w)*(1.-smoothstep(.4, .95, slope))*(.35+.65*rock.w);
   veg += .005*suit*(.015+around)*max(fertile-veg, 0.)-.0015*max(veg-fertile*suit, 0.)-20.*max(e, 0.)-.02*step(.15, d);
   o = vec4(b, d, max(s, 0.), clamp(veg, 0., 1.));
 }`;
 
-SIM.life = `
-uniform sampler2D uS, uC, uW, uLen; uniform float uSteps, uPeople; out vec4 o;
-vec4 S(ivec2 q){ return texelFetch(uS, wrap(q, M), 0); }
-vec4 C(ivec2 q){ return texelFetch(uC, wrap(q, M), 0); }
-float fresh(vec4 s){ return step(.03, s.y)*step(uSea+.3, s.x+s.y); }       // a river or a lake
-float salt(vec4 s){ return step(s.x, uSea-.5)*step(.5, s.y); }             // the sea
+// Lava: a second, slower fluid on the same grid. It wells up along the crests of the land the
+// hand is raising, runs downhill while it is hot, stiffens as it cools (at once under water),
+// and what freezes becomes bedrock. So new land is built the way islands are.
+SIM.lava = `
+uniform sampler2D uS, uL, uRock, uLen, uW; uniform vec4 uBrush; uniform float uBrushR, uTick, uStamp; out vec4 o;
+vec4 lavaAt(ivec2 q, out float s){     // a cell's lava once this tick's share has frozen, and the height of its surface
+  q = wrap(q, M); vec4 l = texelFetch(uL, q, 0); l.x -= frozen(l, uTick); s = texelFetch(uS, q, 0).x+l.x; return l;
+}
+// What one cell passes to a lower neighbour: more when hot, and a cooling flow needs a steeper drop to keep moving.
+float spill(vec4 from, float drop, float run){ return min(.03*uTick*from.y*from.y*max(drop-(.8-.72*from.y)*run, 0.), .11*from.x); }
 void main(){
   ivec2 p = ivec2(gl_FragCoord.xy); vec3 n = decode(gl_FragCoord.xy/N);
+  float s, sk; vec4 l = lavaAt(p, s), len = texelFetch(uLen, p, 0);
+  float depth = l.x, heat = l.x*l.y;                 // heat as a quantity, so that two flows meeting conserve it
+  for(int k=0;k<8;k++){                              // all eight neighbours, or a flow spreads as a diamond
+    vec4 m = lavaAt(p+RING[k], sk); float run = len[k>>1];
+    float gone = spill(l, s-sk, run), come = spill(m, sk-s, run);
+    depth += come-gone; heat += come*m.y-gone*l.y;
+  }
+  float vent = exp(-6.*R*R*(1.-dot(n, uBrush.xyz))/(uBrushR*uBrushR))*uBrush.w*smoothstep(.4, .75, texelFetch(uRock, p, 0).y);   // fissures along the crests, near the middle of the push
+  depth += vent; heat += vent;
+  float quench = .0007+.05*smoothstep(.1, .6, texelFetch(uS, p, 0).y)+.003*textureLod(uW, gut(n, NW), 0.).g;   // air, sea, rain
+  o = vec4(depth, depth>1e-4 ? clamp(heat/depth-uTick*quench/(.25+depth), 0., 1.) : 0., depth>.15 ? uStamp : l.z, 0.);
+}`;
+
+SIM.life = `
+uniform sampler2D uS, uC, uW, uLen, uG, uD3; uniform float uSteps, uPeople;
+layout(location=0) out vec4 o; layout(location=1) out vec4 oG;
+const float FARTHEST = .4*N;                      // as far as anyone will travel, in cells of flat ground
+vec4 S(ivec2 q){ return texelFetch(uS, wrap(q, M), 0); }
+vec4 C(ivec2 q){ return texelFetch(uC, wrap(q, M), 0); }
+float high;                                                                // the sea's surface here at this state of the tide
+float fresh(vec4 s){ return step(.03, s.y)*step(high+.3, s.x+s.y); }       // a river or a lake
+float salt(vec4 s){ return step(s.x, uSea-.5)*step(.5, s.y); }             // the sea
+void main(){
+  ivec2 p = ivec2(gl_FragCoord.xy); vec3 n = decode(gl_FragCoord.xy/N); high = uSea+max(tide(n), 0.);
   vec4 s = S(p), sl = S(p+ivec2(-1,0)), sr = S(p+ivec2(1,0)), su = S(p+ivec2(0,1)), sd = S(p+ivec2(0,-1));
   vec4 c = C(p), cl = C(p+ivec2(-1,0)), cr = C(p+ivec2(1,0)), cu = C(p+ivec2(0,1)), cd = C(p+ivec2(0,-1));
   float rain = textureLod(uW, gut(n, NW), 0.).g, T = temperature(n, s.x), dry = step(uSea, s.x)*step(s.y, .3);
@@ -358,20 +406,39 @@ void main(){
   // interior stays sparse. Flood, ice or the loss of the forest drives them out.
   float coast = max(max(salt(sl), salt(sr)), max(salt(su), salt(sd)));
   float slope = length(.5*vec2(sr.x-sl.x, su.x-sd.x)/texelFetch(uLen, p, 0).xy);
-  float home = dry*step(ice, .05)*smoothstep(.15, .5, s.w)*smoothstep(.04, .2, T)*(1.-smoothstep(.2, .5, slope))
+  float home = dry*step(uSea+uTide.w+.15, s.x)*step(ice, .05)*smoothstep(.15, .5, s.w)*smoothstep(.04, .2, T)*(1.-smoothstep(.2, .5, slope))   // above the highest tide
              * (.3+.7*max(coast, smoothstep(.4, .75, c.z)));
   float around = max(max(cl.y, cr.y), max(cu.y, cd.y));
   vec3 dice = vec3(gl_FragCoord.xy, uTime);        // three rolls: one hash has too few bits for odds this long
   float spark = uPeople*step(.99, hash(dice))*step(.99, hash(dice.yzx+17.))*step(.99, hash(dice.zxy+31.));
   float pop = clamp(c.y+uSteps*(.012*(max(c.y, around)+8.*spark)*max(home-c.y, 0.)-.008*max(c.y-home, 0.)), 0., 1.);
   o = vec4(ice, pop, clamp(soil, 0., 1.), 0.);
+
+  // Roads are rivers of people. Each cell keeps a toll: the effort of reaching somewhere busier
+  // than itself by way of its cheapest neighbour. Whoever lives in a cell sets off that way, and
+  // the number passing through is the road. Effort is distance, made worse by slopes, water and
+  // ice and eased by a road already there, which is what gathers paths into highways. So a
+  // pass carved through a range, or a strait closed, redraws the map.
+  vec4 len = texelFetch(uLen, p, 0), mine = texelFetch(uG, p, 0);
+  float effort = (1.+8.*slope*slope+step(.05, s.y)+6.*step(.05, ice))*(1.-.6*smoothstep(3., 25., mine.y));
+  // Somewhere busier: the middle of a town draws its surroundings, and a town in a populous region draws other towns.
+  vec2 here = gut(n, N); float town = smoothstep(.02, .3, textureLod(uD3, here, ${Math.log2(N) - 6}.).x);
+  float toll = FARTHEST*(1.-.5*town*(1.+smoothstep(0., .1, textureLod(uD3, here, ${Math.log2(N) - 4}.).x))), through = pop, heading = 8.;
+  for(int k=0;k<8;k++){
+    ivec2 q = p+RING[k]; vec4 g = texelFetch(uG, wrap(q, M), 0);
+    float via = g.x+effort*len[k>>1];
+    if(via<toll){ toll = via; heading = float(k); }
+    // Does that neighbour send its travellers here? Across a fold of the map, its way to us has our way to it, not the opposite.
+    if(int(g.z)==((q.x<0 || q.y<0 || q.x>M || q.y>M) ? k : k^1)) through += .995*g.y;
+  }
+  oG = vec4(toll, min(through, 999.), heading, 0.);
 }`;
 
 // Weather. Moisture evaporates from warm sea, rides the wind, and falls wherever air is made to
 // rise: at the equator, in storms, and above all on the windward side of mountains, which leaves
 // the far side dry. Cloud texture is carried along the same winds.
 SIM.weather = `
-uniform sampler2D uPrev, uD0; uniform float uDt, uClock; uniform vec4 uVortex[6]; out vec4 o;
+uniform sampler2D uPrev, uD0, uD3; uniform float uDt, uClock; uniform vec4 uVortex[6]; out vec4 o;
 float land(vec3 n){ return max(textureLod(uD0, gut(n, N), 0.).x-uSea, 0.); }
 // The winds: easterly trades in the tropics and westerlies beyond, both leaning toward the
 // equator; drifting eddies; and a handful of cyclones turning the way their hemisphere demands.
@@ -390,9 +457,10 @@ vec3 windAt(vec3 n, out float storm){
 void main(){
   ivec2 me = wrap(ivec2(gl_FragCoord.xy)-1, MW); vec3 n = decode((vec2(me)+.5)/NW);
   float storm; vec3 wind = windAt(n, storm); float speed = length(wind);
-  float q = textureLod(uPrev, gut(normalize(n-wind*uDt), NW), 0.).b;       // moisture, carried here by the wind
+  vec4 was = textureLod(uPrev, gut(normalize(n-wind*uDt), NW), 0.);        // what the wind has carried here
   vec4 g = textureLod(uD0, gut(n, N), 0.);
-  float sea = step(g.x, uSea-.2), T = temperature(n, g.x);
+  float q = was.b, sea = step(g.x, uSea-.2), T = temperature(n, g.x), fire = textureLod(uD3, gut(n, N), 1.).z;
+  float ash = clamp(was.a*(1.-.5*uDt)+10.*uDt*fire*fire, 0., 1.);           // an eruption stains the sky downwind
 
   // Flow noise: the cloud texture is traced back along the wind in two half-offset phases, so it
   // shears into streaks and spirals without ever smearing out.
@@ -401,40 +469,41 @@ void main(){
     float f = fract(cycle+.5*float(k));
     grain += (1.-abs(2.*f-1.))*fbm(normalize(n-wind*f*.3)*3.5+uSeed+11.*floor(cycle+.5*float(k))+5.*float(k));
   }
-  q += uDt*(.7*sea*max(T+.15, 0.)+.15*(1.-sea)*g.z)*(1.-q);       // evaporation; forests breathe a little back
+  q += uDt*(.7*sea*max(T+.15, 0.)+.15*(1.-sea)*g.z+.8*fire)*(1.-q);   // evaporation; forests breathe a little back; lava boils the sea
 
   vec3 along = .03*wind/max(speed, 1e-4);
   float rise = land(normalize(n+along))-land(normalize(n-along));            // height gained along the wind
   float belt = exp(-51.*n.y*n.y)-.8*exp(-51.*(abs(n.y)-.47)*(abs(n.y)-.47)); // air rises at the equator and sinks in the horse latitudes
-  float slope = .03*max(rise, 0.)*speed, lift = .5*belt+1.6*storm+.3*(1.-smoothstep(-.2, .3, T));
-  float cover = smoothstep(.66, 1.1, q+3.*(grain-.5)+.4*lift+.15*slope);
+  float slope = .03*max(rise, 0.)*speed, lift = .5*belt+1.6*storm+.3*(1.-smoothstep(-.2, .3, T))+.6*fire;
+  float cover = max(smoothstep(.66, 1.1, q+3.*(grain-.5)+.4*lift+.15*slope), .7*smoothstep(.25, 1., ash*(.4+1.2*grain)));
   float rain = clamp(smoothstep(.5, .95, cover)*q*(1.+2.*lift)+.5*q*min(slope, 1.)*smoothstep(.1, .5, cover), 0., 1.);
-  o = vec4(cover, rain, clamp(q-uDt*1.2*rain*q, 0., 1.), 0.);
+  o = vec4(cover, rain, clamp(q-uDt*1.2*rain*q, 0., 1.), ash);
 }`;
 
 // What the renderer samples: filterable half-float copies of the state, each with its gutter,
 // plus the surface normal, taken here at full precision from the neighbours' positions in space.
 SIM.derive = `
-uniform sampler2D uS, uV, uC;
+uniform sampler2D uS, uV, uC, uL; uniform float uStamp;
 layout(location=0) out vec4 o0; layout(location=1) out vec4 o1; layout(location=2) out vec4 o2; layout(location=3) out vec4 o3;
 vec3 at(ivec2 q){ vec4 s = texelFetch(uS, wrap(q, M), 0); return decode((vec2(q)+.5)/N)*(R+ZS*(s.x+s.y)); }
 void main(){
   ivec2 p = wrap(ivec2(gl_FragCoord.xy)-1, M);
-  vec4 c = texelFetch(uS, p, 0), life = texelFetch(uC, p, 0); vec2 v = texelFetch(uV, p, 0).xy;
+  vec4 c = texelFetch(uS, p, 0), life = texelFetch(uC, p, 0), lava = texelFetch(uL, p, 0); vec2 v = texelFetch(uV, p, 0).xy;
   vec3 dx = at(p+ivec2(1,0))-at(p+ivec2(-1,0)), dy = at(p+ivec2(0,1))-at(p+ivec2(0,-1));
   o0 = vec4(c.x, c.y, c.w, length(v));               // bed, water, vegetation, speed
   o1 = vec4(normalize(cross(dy, dx)), c.z);          // normal of the top surface, sediment
   o2 = vec4(.5*(dx*v.x+dy*v.y), life.x);             // current as a vector in space, ice
-  o3 = vec4(life.y, life.z, 0., 0.);                 // people, soil moisture
+  // people, soil moisture, how hot the lava is, and how lately it ran: where it did, the rock stays black for an age
+  o3 = vec4(life.y, life.z, lava.y*smoothstep(0., .06, lava.x), lava.z>0. ? exp(-.12*max(uStamp-lava.z, 0.)) : 0.);
 }`;
 
 // Sun shadow and ambient occlusion for every cell, marched through the heightfield itself, so
 // that the screen-space shader never has to cast a shadow ray.
 SIM.shadow = `
-uniform sampler2D uD0; uniform vec3 uSun; out vec4 o;
+uniform sampler2D uD0, uG; uniform vec3 uSun; out vec4 o;
 float top(vec3 dir){ vec4 c = textureLod(uD0, gut(dir, N), 0.); return R+ZS*(c.x+c.y); }
 void main(){
-  vec3 n = decode((vec2(wrap(ivec2(gl_FragCoord.xy)-1, M))+.5)/N);
+  ivec2 cell = wrap(ivec2(gl_FragCoord.xy)-1, M); vec3 n = decode((vec2(cell)+.5)/N);
   float r0 = top(n), sh = 1., ao = 0., t = 1.;
   vec3 e1 = normalize(cross(n, vec3(.31, .9, .2))), e2 = cross(n, e1);
   for(int i=0;i<8;i++){                              // occlusion: how far the land around stands above this spot
@@ -450,7 +519,7 @@ void main(){
       if(r>R+ZS*HMAX) break;
     }
   }
-  o = vec4(clamp(sh, 0., 1.), clamp(1.-.5*ao/ZS, .25, 1.), 0, 1);
+  o = vec4(clamp(sh, 0., 1.), clamp(1.-.5*ao/ZS, .25, 1.), smoothstep(5., 40., texelFetch(uG, cell, 0).y), 1);   // and how busy the road is here
 }`;
 
 const TRACE = `
@@ -464,11 +533,11 @@ vec2 sphere(vec3 ro, vec3 rd, float r){            // where a ray enters and lea
 float top(vec3 dir){ vec4 c = textureLod(uD0, gut(dir, N), 0.); return R+ZS*(c.x+c.y); }
 // March against the displaced sphere. Talus erosion bounds the terrain's slope, so a fixed
 // fraction of the height above ground is always a safe step; once a step lands underground,
-// bisection pins the hit. A ray that reaches the sea's own sphere first has hit open water.
+// bisection pins the hit. Nothing wet lies below the sea at its lowest ebb, so the march ends there.
 bool scene(vec3 ro, vec3 rd, out float t){
   vec2 shell = sphere(ro, rd, R+ZS*HMAX); t = max(shell.x, 0.);
   if(shell.y<t) return false;
-  float sea = sphere(ro, rd, R+ZS*uSea).x, end = min(shell.y, sea>0. ? sea : FAR), tp = t;
+  float sea = sphere(ro, rd, R+ZS*(uSea-.5*uTide.w)-.01).x, end = min(shell.y, sea>0. ? sea : FAR), tp = t;   // the sea at its lowest ebb
   for(int i=0;i<96;i++){
     vec3 p = ro+rd*t; float r = length(p), dy = r-top(p/r);
     if(dy<0.){
@@ -485,14 +554,16 @@ bool scene(vec3 ro, vec3 rd, out float t){
 // A few pixels of ground truth for the CPU: where the pointer's ray lands, the state under the
 // brush, and what lies under the centre of the view.
 SIM.pick = TRACE + `
-uniform sampler2D uW; uniform vec3 uRd, uProbe, uLook; out vec4 o;
+uniform sampler2D uW, uD3; uniform vec3 uRd, uProbe, uLook; out vec4 o;
 void main(){
   float t;
   if(gl_FragCoord.x<1.){ bool hit = scene(uRo, uRd, t); o = vec4(uRo+uRd*t, hit ? 1. : 0.); }
   else if(gl_FragCoord.x<2.) o = textureLod(uD0, gut(uProbe, N), 0.);
   else {
     bool hit = scene(uRo, uLook, t); vec3 d = normalize(uRo+uLook*t); vec4 c = textureLod(uD0, gut(d, N), 0.);
-    o = hit ? vec4(c.x-uSea, c.z, textureLod(uW, gut(d, NW), 0.).g, 1.) : vec4(0.);
+    if(!hit) o = vec4(0.);
+    else if(gl_FragCoord.x<3.) o = vec4(c.x-uSea, c.z, textureLod(uW, gut(d, NW), 0.).g, 1.);
+    else o = textureLod(uD3, gut(d, N), 3.);         // people and fire thereabouts
   }
 }`;
 
@@ -500,9 +571,15 @@ void main(){
 // height. Depth toward the sun has a closed form (Schüler's fit to the Chapman function), so the
 // only loop is the one along the view ray.
 const SKY = `
-uniform vec3 uSun; uniform vec4 uFlash[4];
+uniform vec3 uSun; uniform vec4 uFlash[4], uMoon;   // uMoon: where the moon is, and how much light it sends
 const float HR = .012*R, HM = .005*R, RA = 1.085*R, SUNC = 5.5, RC = R+ZS*9., TC = ZS*8.;   // scale heights; top of the air; sun; cloud base and depth
 const vec3 BR = vec3(.045, .105, .24)/HR; const float BM = .03/HM;                          // scattering per unit length at sea level
+const float RM = ${MOON_R}*R; const vec3 MOONC = vec3(.14, .19, .3);                         // the moon's size; the colour of its light
+// The moon's shadow is a column pointing away from the sun: dark at the core, full light at the edge.
+float eclipse(vec3 p){
+  vec3 d = p-uMoon.xyz; float along = dot(d, uSun);
+  return along>0. ? 1. : smoothstep(.5*RM, 1.35*RM, length(d-uSun*along));
+}
 float chapman(float x, float mu){ float c = sqrt(1.5708*x); return c/((c-1.)*mu+1.); }
 float depthToSun(float r, float mu, float H){      // r = distance from the centre, mu = cosine of the sun's zenith angle there
   float x = r/H, rho = exp((R-r)/H);
@@ -545,7 +622,7 @@ void main(){
         float x = k==0 ? 1.-i/7. : i/7., dt = 2.*len*x/7.;
         vec3 p = uRo+rd*(low+(k==0 ? -len : len)*x*x); float r = length(p), mu = dot(p, uSun)/r;
         float dR = exp((R-r)/HR)*dt, dM = exp((R-r)/HM)*dt;
-        glow += pass*exp(-BR*depthToSun(r, mu, HR)-BM*depthToSun(r, mu, HM))*(BR*dR*pr+BM*dM*pm)*SUNC*1.6;
+        glow += pass*exp(-BR*depthToSun(r, mu, HR)-BM*depthToSun(r, mu, HM))*(BR*dR*pr+BM*dM*pm)*SUNC*1.6*eclipse(p);
         pass *= exp(-BR*dR-BM*dM);
       }
     }
@@ -555,7 +632,7 @@ void main(){
 
 const RENDER = TRACE + SKY + `
 uniform sampler2D uD1, uD2, uD3, uSh, uW, uAir, uAirPass;
-uniform vec4 uBrush; uniform float uBrushR;
+uniform vec4 uBrush, uCraft[10]; uniform float uBrushR, uBase; uniform vec2 uTurn;
 out vec4 o;
 vec3 tangent(vec3 v, vec3 up){ return v-up*dot(v, up); }   // the part of v that lies along the ground
 
@@ -581,7 +658,7 @@ vec3 shade(vec3 p, vec3 rd, float t){
   float r = length(p); vec3 up = p/r; vec2 uv = gut(up, N);
   float px = t*2.*length(uCu)/uRes.y, zoom = 1.-smoothstep(.1, .25, px);   // ground covered by one pixel; how magnified the map is
   vec4 c = soft(uD0, uv, zoom), g = soft(uD1, uv, zoom), sh = soft(uSh, uv, zoom),
-       f = textureLod(uD2, uv, 0.), life = textureLod(uD3, uv, 0.);
+       f = textureLod(uD2, uv, 0.), life = soft(uD3, uv, zoom);
   // Thin sheets of rain run downhill in pulses a cell wide; averaged over 2×2 cells (the next
   // mip) they are an even film. Rivers, lakes and sea keep their own depth.
   float film = textureLod(uD0, uv, 1.).y, d = mix(film, c.y, smoothstep(.1, .3, film));
@@ -591,8 +668,12 @@ vec3 shade(vec3 p, vec3 rd, float t){
   float night = 1.-smoothstep(-.15, .1, mu);
   // The sun here: reddened by the air it crossed, hidden by mountains, dimmed by cloud overhead.
   float overhead = textureLod(uW, gut(normalize(p+uSun*(RC+.5*TC-r)/max(mu, .15)), NW), 0.).r;
-  vec3 sun = sunAt(r, mu)*sh.x*(1.-.8*smoothstep(.15, .75, overhead));
-  vec3 ambient = mix(dome(mu, 0., .5)*.45, dome(mu, 1., .5), .5+.5*dot(nrm, up))*sh.y+vec3(.0015, .002, .004);
+  float ecl = eclipse(p), dim = .1+.9*ecl;          // inside the moon's shadow the sun goes out and the sky dims with it
+  vec3 sun = sunAt(r, mu)*sh.x*(1.-.8*smoothstep(.15, .75, overhead))*ecl;
+  vec3 ambient = mix(dome(mu, 0., .5)*.45, dome(mu, 1., .5), .5+.5*dot(nrm, up))*sh.y*dim+vec3(.0015, .002, .004);
+  // Moonlight: a second, far weaker sun, which is what makes the night side a place and not a silhouette.
+  vec3 md = normalize(uMoon.xyz);
+  vec3 moonlight = MOONC*uMoon.w*smoothstep(-.1, .25, dot(up, md))*(1.-.6*smoothstep(.35, .85, textureLod(uW, gut(up, NW), 0.).r))*sh.y;
 
   // Ground. Strata are a function of height alone, so rivers cut down through visible layers.
   // Climate chooses the rest: sand or loam, savanna or rainforest or taiga, snow.
@@ -612,11 +693,22 @@ vec3 shade(vec3 p, vec3 rd, float t){
   vec3 leaf = mix(vec3(.13, .19, .05), vec3(.035, .09, .025), smoothstep(.5, 1., veg+.3*(n1.x-.5)));
   leaf = mix(mix(leaf, vec3(.27, .24, .08), .75*arid), vec3(.05, .09, .06), .8*cold);
   alb = mix(alb, leaf, canopy);
-  float snow = smoothstep(.05, .5, f.w+.3*(n1.x-.5)*step(.01, f.w));
+  float molten = life.z, basalt = life.w;
+  alb = mix(alb, vec3(.045, .04, .042)*(.5+n2.x), basalt);
+  float snow = smoothstep(.05, .5, f.w+.3*(n1.x-.5)*step(.01, f.w))*(1.-basalt);
   alb = mix(alb, vec3(.8, .85, .92), snow);
+  // Where people farm, the ground is parcelled out: crop, stubble and fallow, in a grid that the
+  // globe cuts through at an angle. Between the towns run the roads their traffic has worn.
+  float farm = smoothstep(.05, .3, life.x)*(1.-steep)*(1.-snow)*(1.-basalt)*step(d, .05), road = sh.z*(1.-snow)*step(d, .05);
+  if(farm>0.){
+    float k = hash(floor(OCT*p*.9));
+    vec3 crop = k<.4 ? vec3(.15, .25, .07) : k<.75 ? vec3(.5, .42, .17) : vec3(.3, .21, .13);
+    alb = mix(alb, mix(vec3(.33, .31, .13), crop, 1.-smoothstep(.12, .35, px)), .75*farm);
+  }
+  alb = mix(alb, vec3(.46, .4, .32), .6*road);
   alb *= 1.-.45*clamp(smoothstep(0., .05, d)+d*4., 0., 1.);                                        // wet ground is darker
   // Fine relief: rock grain and gullies, a bumpy canopy where it is wooded, dunes on open sand.
-  float bare = (1.-canopy)*(1.-snow), rocky = bare*max(steep, .5*cold), sandy = bare*arid*(1.-steep)*smoothstep(.3, 1.5, h);
+  float bare = (1.-canopy)*(1.-snow), rocky = bare*max(max(steep, .5*cold), basalt), sandy = bare*arid*(1.-steep)*smoothstep(.3, 1.5, h);
   vec4 bumps = w2*.45*mix(.4+.4*steep, 1.6, canopy)*relief(n2, rocky)+w3*.4*mix(.5+.5*steep, 1.3, canopy)*relief(n3, rocky)+w4*.3*relief(n4, rocky);
   if(sandy>.02 && w2>0.){
     vec4 dune = noised(p*vec3(.45, 1.5, .45)+uSeed.zxy+1.6*n1.x);   // stretched, so its crests run in lines; warped, so they wander
@@ -624,7 +716,13 @@ vec3 shade(vec3 p, vec3 rd, float t){
   }
   alb *= 1.-.7*bumps.w*(1.-.7*snow);
   vec3 n = normalize(up+tangent(nrm, up)*.6/ZS+tangent(n1.yzw, up)*.3*(1.-.6*canopy)*(1.-.5*sandy)+tangent(bumps.xyz, up)*(1.-.8*snow));   // slopes exaggerated, as on a relief map
-  vec3 col = alb*(sun*max(dot(n, uSun), 0.)+ambient+flashes(up, 3000.));
+  vec3 col = alb*(sun*max(dot(n, uSun), 0.)+ambient+flashes(up, 3000.))+mix(vec3(dot(alb, vec3(.3, .5, .2))), alb, .3)*moonlight*max(dot(n, md), 0.);   // by moonlight the eye loses colour
+  if(molten>.003){
+    // Lava gives its own light. As it cools a crust closes over it, and the glow retreats into the cracks.
+    float plate = mix(noise(OCT*p*.8+1.3*n2.yzw), n3.x, .35*w3), seam = 1.-smoothstep(0., .03+.05*molten, abs(plate-.62));
+    float open = max(smoothstep(-.12, .12, .95*molten-.25-1.25*plate), seam*smoothstep(.1, .3, molten));
+    col = col*(1.-.85*smoothstep(0., .2, molten))+(vec3(1., .26, .03)*pow(molten, 1.5)+vec3(.45, .3, .1)*pow(molten, 5.))*(3.2-1.8*plate)*open;
+  }
 
   float wet = smoothstep(.008, .06, d);
   if(wet>0.){
@@ -636,25 +734,25 @@ vec3 shade(vec3 p, vec3 rd, float t){
     vec3 wn = normalize(nrm+tangent(rip, up)*.35*calm*smoothstep(0., 1.2, d));
     float fres = .02+.98*pow(1.-max(dot(-rd, wn), 0.), 5.), fn0 = noise(p*.7+uTime*vec3(.2, .1, .15));
     vec3 rr = reflect(rd, wn);
-    vec3 refl = dome(mu, abs(dot(rr, up))+.02, .5+.5*dot(normalize(tangent(rr, up)+1e-5), normalize(tangent(uSun, up)+1e-5)));
+    vec3 refl = dim*dome(mu, abs(dot(rr, up))+.02, .5+.5*dot(normalize(tangent(rr, up)+1e-5), normalize(tangent(uSun, up)+1e-5)));
 
     // Looking in: light is absorbed red first (Beer's law), so shallows go turquoise and depths
     // go blue. Sediment in suspension turns the water opaque and brown.
     float silt = min(g.w*22., 1.), path = d/max(dot(-rd, up), .3);
     vec3 ext = exp(-path*mix(vec3(2., .55, .36), vec3(1.8, 2.2, 2.8), silt));
-    vec3 inLight = sun*max(mu, 0.)*.45+dome(mu, .6, .5)*.9;
+    vec3 inLight = sun*max(mu, 0.)*.45+dome(mu, .6, .5)*.9*dim+moonlight*.4;
     vec3 w = mix(col*ext+mix(vec3(.002, .035, .06), vec3(.3, .21, .11), silt)*inLight*(1.-ext), refl, fres);
     w *= 1.+(1.2*dot(tangent(rip, up), uSun)+.22*w3*(chop.x-.5))*smoothstep(0., 1.2, d);   // faces of waves that lean toward the sun are brighter
-    float glint = max(dot(rr, uSun), 0.);
-    w += sun*(1.2*pow(glint, 160.)*(.5+fn0)+.08*pow(glint, 14.))*(1.-smoothstep(.2, .8, slope));
+    float glint = max(dot(rr, uSun), 0.), glade = max(dot(rr, md), 0.);       // the sun's glitter, and the moon's path on the water
+    w += (sun*(1.2*pow(glint, 160.)*(.5+fn0)+.08*pow(glint, 14.))+moonlight*(2.*pow(glade, 160.)*(.5+fn0)+.4*pow(glade, 14.)))*(1.-smoothstep(.2, .8, slope));
 
     // White water where the current is fast, and surf where the sea meets a beach. The foam
     // texture is carried by the current in two half-offset phases, so it flows without smearing.
     float ph = fract(uTime*.4); vec3 fl = f.xyz*9.;
     float fn = mix(noise(p*1.4-fl*ph), noise(p*1.4-fl*fract(ph+.5)+5.), abs(1.-2.*ph));
     float rapids = .6*smoothstep(.6, 1.2, c.w)*(1.-smoothstep(.3, 2., d))*smoothstep(.12, .3, d);
-    float shore = step(h+d, .6), surf = (1.-smoothstep(.03, .35, d))*shore*(.5+.45*sin(uTime*1.1+6.*noise(p*.06)+d*9.));
-    float foam = smoothstep(.55, .9, .5*fn+max(rapids, surf));
+    float shore = step(h+d-tide(up), .6), surf = (1.-smoothstep(.03, .35, d))*shore*(.5+.45*sin(uTime*1.1+6.*noise(p*.06)+d*9.));
+    float foam = smoothstep(.55, .9, .5*fn+max(max(rapids, surf), (.2+fn)*smoothstep(.02, .3, textureLod(uD3, uv, 1.).z)));   // and steam where lava meets the sea
     w = mix(w, vec3(.8, .84, .86)*(inLight+sun*.15), foam*.9);
     w += night*vec3(.01, .16, .2)*(foam+smoothstep(.03, .3, c.w)*(.3+.7*fn))*(.2+.8*shore)*smoothstep(.45, .7, noise(p*.04+uTime*.02));   // on some nights, in some bays, disturbed water glows
     float floe = shore*(1.-smoothstep(-.24, -.04, T+.3*(.6*noise(p*.05)+.4*noise(p*.16)-.5)));   // pack ice on cold seas
@@ -665,6 +763,9 @@ vec3 shade(vec3 p, vec3 rd, float t){
   // few live the lights are scattered; where many do they run together into cities.
   float town = smoothstep(.62, .95, .55*noise(p*.55+uSeed)+.45*noise(p*2.6)+.55*life.x-.2)*smoothstep(.02, .15, life.x);
   col += night*(1.-wet)*mix(vec3(1., .5, .16), vec3(1., .8, .55), town)*(7.*town+.12*life.x);
+  // Roads by night are strings of lamps; sea lanes, and the waters off a busy coast, carry the scattered lights of boats.
+  float boats = max(sh.z, smoothstep(.04, .25, textureLod(uD3, uv, 3.).x))*step(.9, noise(p*2.3+.03*uTime));
+  col += night*vec3(1., .72, .42)*(5.*sh.z*(.25+smoothstep(.35, .7, noise(p*2.9+uSeed.zxy)))*(1.-wet)+5.*boats*wet);
   float ring = sqrt(2.*max(1.-dot(up, uBrush.xyz), 0.))*R/uBrushR;
   col += vec3(1., .8, .55)*uBrush.w*(.5*(1.-smoothstep(0., .05, abs(ring-1.2)))+.1*exp(-ring*ring))*(.2+.2*sun.r+.15*night);
   return col;
@@ -676,11 +777,12 @@ float coverAt(vec3 dir){ return textureLod(uW, gut(dir, NW), 0.).r; }
 vec4 clouds(vec3 ro, vec3 rd, float tEnd){
   vec2 outer = sphere(ro, rd, RC+TC), inner = sphere(ro, rd, RC);
   if(outer.x<=0. || outer.x>=tEnd) return vec4(0.);
-  float tb = min(inner.x>0. && inner.x<FAR ? inner.x : outer.y, tEnd), dt = (tb-outer.x)/4., alpha = 0., lit = 0.;
+  float tb = min(inner.x>0. && inner.x<FAR ? inner.x : outer.y, tEnd), dt = (tb-outer.x)/4., alpha = 0., lit = 0., soot = 0.;
   float fine = 1.-smoothstep(.25, .6, outer.x*2.*length(uCu)/uRes.y);   // extra detail, only when close enough to resolve it
   vec3 entry = normalize(ro+rd*outer.x), sunward = normalize(tangent(uSun, entry)+1e-4);
   for(float i=.5; i<4.; i++){
-    vec3 p = ro+rd*(outer.x+i*dt); float r = length(p); vec3 dir = p/r; float h = (r-RC)/TC, cover = coverAt(dir);
+    vec3 p = ro+rd*(outer.x+i*dt); float r = length(p); vec3 dir = p/r; vec4 sky = textureLod(uW, gut(dir, NW), 0.);
+    float h = (r-RC)/TC, cover = sky.r;
     if(cover<.03) continue;
     vec4 heap = vec4(.5, 0, 0, 0);                   // up close the cover breaks into heaps: noise, with its gradient for shading
     if(fine>0.){
@@ -689,10 +791,13 @@ vec4 clouds(vec3 ro, vec3 rd, float tEnd){
     }
     float a = (1.-alpha)*(1.-exp(-smoothstep(.1+.25*fine, .8-.25*fine, 1.25*cover-(1.-heap.x)-.45*h*(1.6-cover)+.05)*dt*.5/ZS));
     // One tap toward the sun for the shadow of the cloud beyond; the heap's own slope for its lit and dark sides.
-    lit += a*exp(-2.5*coverAt(normalize(p+sunward*TC*2.))*(1.-.6*h))*clamp(.8-1.1*dot(heap.yzw, sunward), .3, 1.25); alpha += a;
+    lit += a*exp(-2.5*coverAt(normalize(p+sunward*TC*2.))*(1.-.6*h))*clamp(.8-1.1*dot(heap.yzw, sunward), .3, 1.25); alpha += a; soot += a*sky.a;
   }
-  float mu = dot(entry, uSun), facing = dot(entry, -rd);
-  vec3 col = sunAt(RC+.5*TC, mu)*(.15*alpha+.85*lit)*.45+(dome(mu, 1., .5)*.55+flashes(entry, 1200.)*3.)*alpha;
+  float mu = dot(entry, uSun), facing = dot(entry, -rd), ecl = eclipse(entry*RC);
+  vec3 col = sunAt(RC+.5*TC, mu)*ecl*(.15*alpha+.85*lit)*.45+(dome(mu, 1., .5)*.55*(.1+.9*ecl)+flashes(entry, 1200.)*3.)*alpha;
+  col += MOONC*uMoon.w*alpha*(.1+.3*max(dot(entry, normalize(uMoon.xyz)), 0.));   // cloud tops by moonlight
+  // Ash darkens a cloud, and the fire under it lights it from below.
+  col = col*mix(vec3(1.), vec3(.3, .26, .25), soot/max(alpha, 1e-4))+vec3(1., .3, .06)*.3*alpha*textureLod(uD3, gut(entry, N), 3.).z;
   // Seen through the air above it: toward the limb that path is long, and the cloud goes blue.
   vec3 above = exp(-BR*depthToSun(RC+.5*TC, facing, HR)-BM*depthToSun(RC+.5*TC, facing, HM));
   col = col*above+(1.-above)*dome(mu, .25, .5)*1.4*alpha;
@@ -713,10 +818,36 @@ vec3 aurora(vec3 ro, vec3 rd, float tEnd){
     float rays = noise(vec3(along*26., uTime*.4));
     sum += mix(vec3(.1, 1., .4), vec3(.8, .15, .5), k*.5)*exp(-6000.*off*off)*(.3+1.7*rays*rays)*dark/max(dot(dir, -rd), .2);
   }
-  return sum*.18;
+  return sum*.12;
+}
+
+// The moon. Craters of three sizes sit in the cells of a grid that its surface cuts through, over
+// dark seas of old lava. The sun gives it phases, the planet's own glow fills in its night side,
+// and in the planet's shadow the only light to reach it has passed through every sunset on the
+// planet at once. It keeps one face turned to the planet; later, that face may not stay dark.
+vec3 turn(vec3 v){ return vec3(v.x*uTurn.x-v.z*uTurn.y, v.y, v.x*uTurn.y+v.z*uTurn.x); }
+vec4 crater(vec3 g){                               // xyz: which way the ground falls; w: paler rim, darker floor
+  vec3 id = floor(g), c = id+.5+.5*(vec3(hash(id+1.7), hash(id+5.3), hash(id+9.1))-.5);
+  float k = hash(id), d = length(g-c)/(.2+.28*k);
+  if(k<.4 || d>1.7) return vec4(0.);
+  float lip = exp(-14.*(d-1.)*(d-1.));
+  return vec4(normalize(g-c+1e-5)*(d<1. ? 1.6*d : -1.8*lip), .3*lip-.1*(1.-smoothstep(.5, 1., d)));
+}
+vec3 moon(vec3 rd, float t){
+  vec3 at = uRo+rd*t, q = turn((at-uMoon.xyz)/RM), s = turn(uSun), home = turn(-normalize(uMoon.xyz));
+  vec4 dents = crater(q*3.)+.7*crater(q*7.+3.)+.5*crater(q*17.+8.);
+  float alb = mix(.3, .12, smoothstep(.42, .6, fbm(q*1.7+uSeed*.013)))*(1.+dents.w)*(.8+.4*noise(q*30.));
+  float along = dot(at, uSun), sunlit = along>0. ? 1. : smoothstep(.92*R, 1.2*R, length(at-uSun*along));
+  float lit = pow(max(dot(normalize(q-.55*tangent(dents.xyz, q)), s), 0.), .75), facing = max(dot(q, home), 0.);
+  vec3 col = alb*(SUNC*.5*vec3(1., .97, .92)*lit*sunlit+vec3(.8, .2, .06)*.45*lit*(1.-sunlit)
+                 +vec3(.012, .02, .035)*(.5+.5*dot(normalize(uMoon.xyz), uSun))*facing);
+  float site = exp(-(1.-dot(q, home))*700./(.25+uBase))*smoothstep(.55, .8, noise(q*150.));
+  return col+vec3(1., .75, .45)*4.*uBase*site*(1.-lit*sunlit);
 }
 
 vec3 space(vec3 rd){
+  float tm = sphere(uRo-uMoon.xyz, rd, RM).x;
+  if(tm>0. && tm<FAR) return moon(rd, tm);
   // One star in some cells of a grid that the sky's sphere cuts through.
   vec3 q = rd*110., id = floor(q); float k = hash(id);
   vec3 off = fract(q)-.5-.6*(vec3(hash(id+1.7), hash(id+5.3), hash(id+9.1))-.5);
@@ -725,6 +856,19 @@ vec3 space(vec3 rd){
   col += vec3(.5, .55, .8)*.02*exp(-20.*band*band)*(.4+noise(rd*6.)+.5*noise(rd*17.));   // the galaxy
   float s = dot(rd, uSun);
   return col+SUNC*vec3(1., .95, .9)*(9.*smoothstep(.99996, .99999, s)+.05*pow(max(s, 0.), 4000.));
+}
+
+// Ships and satellites are points of light: each adds a glint wherever the ray passes close by,
+// unless the planet is in the way. Warm ones are under power; cold ones only catch the sun.
+vec3 craft(vec3 rd, float depth){
+  vec3 sum = vec3(0.);
+  for(int i=0;i<10;i++){
+    vec3 to = uCraft[i].xyz-uRo; float along = dot(to, rd), w = uCraft[i].w;
+    if(w==0. || along<0. || along>depth) continue;
+    float size = along*3.*length(uCu)/uRes.y, d = (dot(to, to)-along*along)/(size*size);
+    sum += (w>0. ? vec3(1., .7, .4) : vec3(.8, .9, 1.))*abs(w)*(exp(-d)+.05/(1.+d));
+  }
+  return sum;
 }
 
 void main(){
@@ -742,7 +886,7 @@ void main(){
     glow += w*a.rgb; pass += w*texelFetch(uAirPass, at, 0).rgb; total += w;
   }
   vec4 cl = clouds(uRo, rd, depth);
-  o = vec4((col*pass+glow)/max(total, 1e-6)*(1.-cl.a)+cl.rgb+aurora(uRo, rd, depth), hit ? t : 0.);   // depth 0 marks space
+  o = vec4((col*pass+glow)/max(total, 1e-6)*(1.-cl.a)+cl.rgb+aurora(uRo, rd, depth)+craft(rd, depth), hit ? t : 0.);   // depth 0 marks space
 }`;
 
 const POST = {};
@@ -810,25 +954,29 @@ const G = N + 2, TOP = Math.floor(Math.log2(G));                       // size w
 const simTex = () => texture(N, N, SIMF, gl.NEAREST);
 const stateA = simTex(), stateB = simTex(), velocity = simTex();
 const rock = texture(N, N, gl.RGBA16F, gl.NEAREST), lengths = texture(N, N, gl.RGBA16F, gl.NEAREST);
-let fluxes = [target(simTex()), target(simTex())], lives = [target(simTex()), target(simTex())];
+let fluxes = [target(simTex()), target(simTex())], lives = [0, 1].map(() => target(simTex(), simTex()));   // lives: life, and the roads it makes
+let lavas = [0, 1].map(() => target(texture(N, N, gl.RGBA16F, gl.NEAREST)));
 let weather = [0, 1].map(() => target(texture(NW + 2, NW + 2, gl.RGBA16F, gl.LINEAR, true)));
 weather.forEach(w => { w.forecast = peek(w.tex, 5); });                // the 16×16 mip: a forecast the CPU can afford to read
 const toStateA = target(stateA), toFlow = target(stateB, velocity), toBedrock = target(rock, lengths);
-const D = [0, 1, 2, 3].map(i => texture(G, G, gl.RGBA16F, gl.LINEAR, i % 2 === 0)), toDerived = target(...D);
-const means = [0, 2].map(i => peek(D[i], TOP));                        // a map's 1×1 mip is the planet's average
-const toShadow = target(texture(G, G, gl.RGBA8, gl.LINEAR)), toPick = target(texture(3, 1, SIMF, gl.NEAREST));
+const D = [0, 1, 2, 3].map(i => texture(G, G, gl.RGBA16F, gl.LINEAR, i !== 1)), toDerived = target(...D);
+const means = [0, 2, 3].map(i => peek(D[i], TOP));                     // a map's 1×1 mip is the planet's average
+const towns = peek(D[3], TOP - 5);                                     // …and its 32×32 mip is a gazetteer
+const toShadow = target(texture(G, G, gl.RGBA8, gl.LINEAR)), toPick = target(texture(4, 1, SIMF, gl.NEAREST));
 
 // ───────────────────────────────────────────────────────────── world state
 let seed = parseInt(location.hash.slice(1), 36);
 if (!(seed > 0)) seed = 1 + Math.floor(Math.random() * 36 ** 4);
 let seedVec, started = false, idle = 0, frameCount = 0, warmup = 0, stepDebt = 0;
 const world = { time: 0, clock: 0, age: 0, dt: 0, pace: 1, far: 1, sea: 0, warm: 1,
-  h: 0, water: 0, speed: 0, meanH: 0, meanSpeed: 0, meanIce: 0, land0: null, ice0: null };
-const look = { h: 0, veg: 0, rain: 0, hit: false, dir: [0, 0, 1], range: R };   // what lies under the centre of the view, and how far off
-const brush = { dir: [0, 0, 1], target: [0, 0, 1], s: 0, radius: 20, glow: 0 };
+  h: 0, water: 0, speed: 0, meanH: 0, meanSpeed: 0, meanIce: 0, land0: null, ice0: null, people: 0, fire: 0, molten: 0, capital: null, city: 0 };
+const look = { h: 0, veg: 0, rain: 0, people: 0, fire: 0, hit: false, dir: [0, 0, 1], range: R };   // what lies under the centre of the view, and how far off
+const stamp = () => 1 + world.clock / 16;       // the date, as the lava map records it
+const brush = { dir: [0, 0, 1], target: [0, 0, 1], s: 0, radius: 20, glow: 0, vent: 0 };
 const cam = { az: 0, lat: .3, dist: 4.7 * R, azT: 0, latT: .3, distT: 4.7 * R, drift: 1, tanV: .29 };
 const sun = { angle: 0, dir: [0, 0, 1] };
-const globals = () => ({ uTime: world.time, uSea: world.sea, uWarm: world.warm, uSeed: seedVec });
+const moon = { angle: 0, dir: [0, 0, 1], pos: [0, 0, MOON_D], light: 0, base: 0 };
+const globals = () => ({ uTime: world.time, uSea: world.sea, uWarm: world.warm, uSeed: seedVec, uTide: [...moon.dir, TIDE] });
 const eye = () => ({ ...globals(), uD0: D[0], uRo: cam.pos, uCr: cam.r, uCu: cam.u, uCf: cam.f });
 
 function newWorld(s) {
@@ -837,12 +985,14 @@ function newWorld(s) {
   seedVec = [(seed % 997) * .731, (Math.floor(seed / 997) % 991) * .517, (seed % 89) * 1.37];
   Object.assign(world, { clock: 0, age: 0, sea: 0, warm: 1, land0: null, ice0: null });
   draw(P.bedrock, toBedrock, globals());
+  const wipe = (list, ...rgba) => list.forEach(t => { gl.bindFramebuffer(gl.FRAMEBUFFER, t.fbo); gl.clearColor(...rgba); gl.clear(gl.COLOR_BUFFER_BIT); });
+  wipe(fluxes, 0, 0, 0, 0); wipe(lives, 0, 0, 0, 0); wipe(lavas, 0, 0, 0, 0); wipe(weather, 0, 0, .5, 0);
   const fresh = target(stateA, lives[0].tex);
   draw(P.init, fresh, globals()); gl.deleteFramebuffer(fresh.fbo);
-  const wipe = (list, ...rgba) => list.forEach(t => { gl.bindFramebuffer(gl.FRAMEBUFFER, t.fbo); gl.clearColor(...rgba); gl.clear(gl.COLOR_BUFFER_BIT); });
-  wipe(fluxes, 0, 0, 0, 0); wipe(weather, 0, 0, .5, 0);
   sun.angle = seed % 6;
   cam.az = cam.azT = sun.angle + 1.15;         // open on a gibbous planet, the terminator in view
+  moon.angle = cam.az + Math.PI - .62; moon.base = 0;   // …and the moon beyond its night side, about to set behind it
+  Object.assign(voyage, { t: -1, next: 0, count: 0, ripe: 0 });
   warmup = 240;                                // extra steps on a fresh world, so its first rivers are already cut when the veil lifts
 }
 
@@ -854,8 +1004,16 @@ function updateTime(dt) {
   world.time += dt; world.clock += t; world.age += t;
   sun.angle += t * 2 * Math.PI / 300;
   sun.dir = norm([Math.sin(sun.angle), .2, Math.cos(sun.angle)]);       // the axis leans a little toward the sun
+  // The moon circles more slowly, in a plane that holds the sun and wobbles a little about it. So
+  // each time the sun overtakes it, its shadow crosses the planet somewhere, and half a lap later
+  // it passes through the planet's shadow instead. Its light is the lit share of the face we see.
+  moon.angle += t * 2 * Math.PI / 514;
+  moon.dir = norm([Math.sin(moon.angle), .2 * Math.cos(moon.angle - sun.angle) + .1 * Math.sin(world.clock * 2 * Math.PI / 2900 - 1), Math.cos(moon.angle)]);
+  moon.pos = scale(moon.dir, MOON_D);
+  const along = dot(moon.pos, sun.dir), aside = Math.hypot(...add(moon.pos, scale(sun.dir, -along)));
+  moon.light = .5 * (1 - dot(moon.dir, sun.dir)) * (along > 0 ? 1 : smooth(.92 * R, 1.2 * R, aside));
   // Ice ages come and go, and the sea falls and rises with them as water is locked away and released.
-  world.warm = 1 + .14 * Math.sin(world.clock * 2 * Math.PI / 900);
+  world.warm = 1 + .14 * Math.sin(world.clock * 2 * Math.PI / 1500);
   const level = world.ice0 === null ? 0 : clamp(5 * (world.warm - 1) + 3 * (world.ice0 - world.meanIce), -1.6, .7);
   world.sea += (level - world.sea) * ease(t, 25);
 }
@@ -866,22 +1024,33 @@ function simulate(dt) {
   let steps = Math.floor(stepDebt); stepDebt -= steps;
   if (warmup > 0) { steps = MAXSTEPS; warmup -= steps; }
   const g = globals(), lift = brush.s * clamp(.6 * brush.radius, 11, 18) * dt / Math.max(steps, 1);   // a rate per second, not per step; gentler up close
+  // Lava keeps its own clock, one tick a frame, and only while there is any: from the hand's first
+  // push until a while after the last of it has gone dark.
+  const push = Math.max(brush.s, 0);
+  brush.vent += (push - brush.vent) * ease(dt, push > brush.vent ? .15 : 2.5);   // the vents stay open a while after the hand lifts
+  if (brush.vent > .02 || world.fire > 0) world.molten = world.time + 20;
+  const tick = steps && world.time < world.molten ? Math.min(dt * 60, 1.1) : 0;
   for (let i = 0; i < steps; i++) {
     draw(P.flux, fluxes[1], { ...g, uS: stateA, uF: fluxes[0].tex }); fluxes.reverse();
     draw(P.flow, toFlow, { ...g, uS: stateA, uF: fluxes[0].tex });
     draw(P.erode, toStateA, { ...g, uS: stateB, uV: velocity, uC: lives[0].tex, uRock: rock, uLen: lengths, uW: weather[0].tex,
-      uRain: .0045, uBrush: [...brush.dir, lift], uBrushR: brush.radius });
+      uRain: .0045, uBrush: [...brush.dir, lift], uBrushR: brush.radius, uL: lavas[0].tex, uTick: i === steps - 1 ? tick : 0 });
+  }
+  if (tick) {
+    draw(P.lava, lavas[1], { ...g, uS: stateA, uL: lavas[0].tex, uRock: rock, uLen: lengths, uW: weather[0].tex,
+      uBrush: [...brush.dir, 4.5 * brush.vent * dt], uBrushR: brush.radius, uTick: tick, uStamp: stamp() });
+    lavas.reverse();
   }
   if (steps) {
-    draw(P.life, lives[1], { ...g, uS: stateA, uC: lives[0].tex, uW: weather[0].tex, uLen: lengths, uSteps: steps, uPeople: world.age > 240 && Math.random() < .4 ? 1 : 0 });   // now and then, somewhere, a first fire
+    draw(P.life, lives[1], { ...g, uS: stateA, uC: lives[0].tex, uG: lives[0].textures[1], uD3: D[3], uW: weather[0].tex, uLen: lengths, uSteps: steps, uPeople: world.age > 240 && Math.random() < .4 ? 1 : 0 });   // now and then, somewhere, a first fire
     lives.reverse();
   }
-  draw(P.derive, toDerived, { ...g, uS: stateA, uV: velocity, uC: lives[0].tex });
-  gl.bindTexture(gl.TEXTURE_2D, D[0]); gl.generateMipmap(gl.TEXTURE_2D);
+  draw(P.derive, toDerived, { ...g, uS: stateA, uV: velocity, uC: lives[0].tex, uL: lavas[0].tex, uStamp: stamp() });
+  for (const i of frameCount & 1 ? [0] : [0, 3]) { gl.bindTexture(gl.TEXTURE_2D, D[i]); gl.generateMipmap(gl.TEXTURE_2D); }   // the film of rain needs fresh mips; people and fire can wait a frame
   // Shadows and weather change slowly: they take turns.
-  if (frameCount & 1) draw(P.shadow, toShadow, { ...g, uD0: D[0], uSun: sun.dir });
+  if (frameCount & 1) draw(P.shadow, toShadow, { ...g, uD0: D[0], uG: lives[0].textures[1], uSun: sun.dir });
   else {
-    draw(P.weather, weather[1], { ...g, uPrev: weather[0].tex, uD0: D[0], uDt: .05 * 2 * world.dt, uClock: world.clock, uVortex: vortexData });
+    draw(P.weather, weather[1], { ...g, uPrev: weather[0].tex, uD0: D[0], uD3: D[3], uDt: .05 * 2 * world.dt, uClock: world.clock, uVortex: vortexData });
     weather.reverse();
   }
 }
@@ -915,6 +1084,43 @@ function updateWeather(dt) {
     const at = decode((cell % 16 + Math.random()) / 16, ((cell >> 4) + Math.random()) / 16);
     flashData.set([...at, .5 + .5 * Math.random()], (flashSlot++ % 4) * 4);
     thunder(at);
+  }
+}
+
+// ───────────────────────────────────────────────────────────── leaving
+// Fire, then towns, then roads; and once enough of the planet is lit, someone leaves it. A ship
+// climbs from the capital and crosses to the moon, where a light comes on. Others follow, and
+// each leaves a satellite behind.
+const craftData = new Float32Array(40);
+const voyage = { t: -1, next: 0, count: 0, ripe: 0, dir: [0, 0, 1], trail: [] };
+const sats = [0, 1, 2, 3].map(i => ({ axis: norm([Math.sin(i * 2.4), .5 + .4 * Math.cos(i * 1.7), Math.cos(i * 2.4)]), turn: .09 + .02 * i, r: (1.17 + .035 * i) * R }));
+function updateVoyage(dt) {
+  const v = voyage;
+  craftData.fill(0);
+  sats.forEach((s, i) => {
+    if (i >= v.count) return;
+    const e1 = norm(cross(s.axis, [0, 1, 0])), e2 = cross(s.axis, e1), a = world.time * s.turn + i * 1.9;
+    const p = scale(add(scale(e1, Math.cos(a)), scale(e2, Math.sin(a))), s.r), along = dot(p, sun.dir);
+    const lit = along > 0 || Math.hypot(...add(p, scale(sun.dir, -along))) > R;    // they shine only while the sun reaches them
+    craftData.set([...p, lit ? -1.5 : 0], i * 4);
+  });
+  if (v.t < 0) {
+    if (world.city > .22) v.ripe += dt;                            // it takes an age of cities first
+    if (!(started && world.capital && v.ripe > 50 && world.time > v.next)) return;
+    Object.assign(v, { t: 0, dir: world.capital, trail: [] });
+    if (audio.ac) { thunder(v.dir); [5, 7, 9].forEach((step, i) => setTimeout(() => pluck(noteAt(step), .045, 0, 5), i * 240)); }
+  }
+  v.t += dt / 44;
+  // Straight up at first, then leaning over toward the moon, and homing on it at the end.
+  v.dir = toward(v.dir, moon.dir, ease(dt, 9 * (1 - v.t) + .3) * smooth(.05, .25, v.t));
+  const s = v.t * v.t * (3 - 2 * v.t), from = 1.02 * R, burn = .3 + .7 * Math.max(1 - smooth(.12, .3, v.t), smooth(.85, .95, v.t));
+  v.trail.unshift(scale(v.dir, from + (MOON_D - MOON_R * R - from) * s));
+  v.trail.length = Math.min(v.trail.length, 26);
+  for (let k = 0; k < 6; k++) craftData.set([...v.trail[Math.min(k * 5, v.trail.length - 1)], (k ? 5 : 30) * (1 - k / 6) * burn], 16 + k * 4);
+  if (v.t >= 1) {
+    Object.assign(v, { t: -1, next: world.time + 70 + 70 * Math.random(), count: v.count + 1 });
+    moon.base = Math.min(1, moon.base + .2);
+    if (audio.ac) pluck(noteAt(12), .04, 0, 7);
   }
 }
 
@@ -1031,15 +1237,18 @@ function haunt(dt) {
 }
 
 // A census every half second or so: the planet's averages, and where it is raining hardest.
-const pickBuf = new Float32Array(12), statBuf = new Float32Array(4), forecast = new Float32Array(1024);
+const pickBuf = new Float32Array(16), statBuf = new Float32Array(4), forecast = new Float32Array(1024), gazetteer = new Float32Array(4096);
 function census() {
-  const mean = i => {
-    gl.bindTexture(gl.TEXTURE_2D, D[i * 2]); gl.generateMipmap(gl.TEXTURE_2D);
-    gl.bindFramebuffer(gl.FRAMEBUFFER, means[i]); gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.FLOAT, statBuf);
-    return statBuf;
-  };
-  const m = mean(0); world.meanH = m[0]; world.meanSpeed = m[3];
+  const mean = i => { gl.bindFramebuffer(gl.FRAMEBUFFER, means[i]); gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.FLOAT, statBuf); return statBuf; };
+  gl.bindTexture(gl.TEXTURE_2D, D[2]); gl.generateMipmap(gl.TEXTURE_2D);   // the other two refresh their mips every frame
+  let m = mean(0); world.meanH = m[0]; world.meanSpeed = m[3];
   world.meanIce = mean(1)[3];
+  m = mean(2); world.people = m[0]; world.fire = m[2];
+  gl.bindFramebuffer(gl.FRAMEBUFFER, towns); gl.readPixels(0, 0, 32, 32, gl.RGBA, gl.FLOAT, gazetteer);
+  let most = .08, where = -1;                    // the capital is wherever the most people live
+  for (let i = 0; i < 1024; i++) if (gazetteer[i * 4] > most) { most = gazetteer[i * 4]; where = i; }
+  world.city = most;
+  world.capital = where < 0 ? null : decode(((where % 32 + .5) / 32 * G - 1) / N, ((where >> 5) + .5) / 32 * G / N - 1 / N);
   if (world.ice0 === null && warmup <= 0) { world.ice0 = world.meanIce; world.land0 = world.meanH; }
   gl.bindTexture(gl.TEXTURE_2D, weather[0].tex); gl.generateMipmap(gl.TEXTURE_2D);
   gl.bindFramebuffer(gl.FRAMEBUFFER, weather[0].forecast); gl.readPixels(0, 0, 16, 16, gl.RGBA, gl.FLOAT, forecast);
@@ -1051,11 +1260,11 @@ function updateBrush(dt) {
   // Ask the GPU where the pointer's ray lands, what lies under the brush, and what we are looking at.
   const rd = pointerRay();
   look.dir = onSphere(cam.f, R); look.range = Math.hypot(...add(cam.pos, scale(look.dir, -R)));
-  draw(P.pick, toPick, { ...eye(), uW: weather[0].tex, uRd: rd, uProbe: brush.dir, uLook: cam.f });
-  gl.readPixels(0, 0, 3, 1, gl.RGBA, gl.FLOAT, pickBuf);
+  draw(P.pick, toPick, { ...eye(), uW: weather[0].tex, uD3: D[3], uRd: rd, uProbe: brush.dir, uLook: cam.f });
+  gl.readPixels(0, 0, 4, 1, gl.RGBA, gl.FLOAT, pickBuf);
   const hit = pickBuf[3] > 0, at = [pickBuf[0], pickBuf[1], pickBuf[2]];
   Object.assign(world, { h: pickBuf[4] - world.sea, water: pickBuf[5], speed: pickBuf[7] });
-  Object.assign(look, { h: pickBuf[8], veg: pickBuf[9], rain: pickBuf[10], hit: pickBuf[11] > 0 });
+  Object.assign(look, { h: pickBuf[8], veg: pickBuf[9], rain: pickBuf[10], hit: pickBuf[11] > 0, people: pickBuf[12], fire: pickBuf[14] });
   if (frameCount % 30 === 0) census();
 
   // A finger waits a moment before it sculpts, in case a second one is on its way to make a pinch.
@@ -1118,10 +1327,11 @@ addEventListener('resize', resize);
 
 function render() {
   const { scene, ldr, bloom, air } = view, res = [scene.w, scene.h];
-  const shared = { ...eye(), uSun: sun.dir, uW: weather[0].tex, uFlash: flashData };
+  const shared = { ...eye(), uSun: sun.dir, uW: weather[0].tex, uFlash: flashData, uMoon: [...moon.pos, moon.light],
+    uTurn: [Math.cos(moon.angle), Math.sin(moon.angle)], uBase: moon.base };
   draw(P.air, air, { ...shared, uRes: [air.w, air.h] });
   draw(P.render, scene, { ...shared, uD1: D[1], uD2: D[2], uD3: D[3], uSh: toShadow.tex, uAir: air.tex, uAirPass: air.textures[1],
-    uRes: res, uBrush: [...brush.dir, brush.glow * .55], uBrushR: brush.radius });
+    uRes: res, uBrush: [...brush.dir, brush.glow * .55], uBrushR: brush.radius, uCraft: craftData });
   // Bloom: threshold, walk down a pyramid, then add each level back into the one above.
   let src = scene;
   bloom.forEach((b, i) => { draw(P.blur, b, { uT: src.tex, uRes: [b.w, b.h], uSpread: .5, uKnee: i ? 0 : 1.1 }); src = b; });
@@ -1173,7 +1383,7 @@ function startAudio() {
   };
   audio.sea = layer('lowpass', 400, .4); audio.wind = layer('bandpass', 650, .7);
   audio.water = layer('bandpass', 2600, .6); audio.rumble = layer('lowpass', 85, 1.5);
-  audio.rain = layer('highpass', 3800, .3);
+  audio.rain = layer('highpass', 3800, .3); audio.fire = layer('bandpass', 1300, .8);
 
   const voice = (type, freq, gain, dest) => {
     const o = ac.createOscillator(), g = ac.createGain();
@@ -1235,6 +1445,7 @@ function updateAudio(dt) {
   to(a.wind.f, 420 + 300 * close + 200 * Math.sin(world.time * .11), .5);
   to(a.water.g, Math.min(.1, close * world.meanSpeed * 2.2 + world.speed * world.water * .08), .25);
   to(a.rain.g, Math.min(.07, close * look.rain * .12), .6);
+  to(a.fire.g, Math.min(.1, close * look.fire * 1.5) * (.3 + 1.4 * Math.random() ** 4), .025);   // lava crackles: a gain that jumps about
   to(a.rumble.g, s * .75); to(a.sub.g, s * .2);
   to(a.sub.f, 38 + 10 * s + 3 * Math.sin(world.time * 9));
 
@@ -1255,6 +1466,7 @@ function updateAudio(dt) {
   }
   to(a.padFilter.frequency, 240 + 420 * day + 500 * world.far + 300 * s, 1);
   if (Math.random() < dt * close * ground * day * Math.min(look.veg * 2.5, 1.6) * (1 - Math.min(look.rain * 3, .9))) chirp();   // birds shelter from rain
+  if (Math.random() < dt * close * .12 * Math.min(look.people * 3, 1)) pluck(noteAt(Math.floor(Math.random() * 5)), .012, Math.random() - .5, 4);   // and where there is a town, now and then, a bell
 }
 
 // ───────────────────────────────────────────────────────────── main loop
@@ -1266,6 +1478,7 @@ function frame(now) {
   updateCamera(dt);
   updateTime(dt);
   updateWeather(dt);
+  updateVoyage(dt);
   simulate(dt);
   updateBrush(dt);
   render();
