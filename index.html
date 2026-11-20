@@ -1,0 +1,887 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>Orogeny</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #06080b; overflow: hidden; touch-action: none;
+    user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; cursor: crosshair; }
+  .type { color: #f6eee2; font: 300 12px/1.6 "Helvetica Neue", Helvetica, Arial, sans-serif;
+    letter-spacing: .42em; text-transform: uppercase; text-shadow: 0 1px 14px rgba(0,0,0,.55); }
+  #veil { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center;
+    justify-content: center; pointer-events: none; transition: opacity 2.4s ease;
+    background: radial-gradient(ellipse at center, rgba(6,8,11,.12) 20%, rgba(6,8,11,.62) 100%); }
+  #veil h1 { font-weight: 100; font-size: clamp(30px, 7vw, 92px); letter-spacing: .5em;
+    margin: 0 0 .5em .5em; }
+  #veil p { margin: 0; padding: 0 2em; text-align: center; opacity: .8;
+    animation: breathe 3.4s ease-in-out infinite; }
+  @keyframes breathe { 50% { opacity: .35; } }
+  #hint { position: fixed; left: 0; right: 0; bottom: 7vh; padding: 0 2em; text-align: center;
+    opacity: 0; transition: opacity 2s ease; pointer-events: none; }
+  #tool { position: fixed; right: 22px; bottom: 22px; width: 46px; height: 46px; border-radius: 50%;
+    border: 1px solid rgba(246,238,226,.4); display: flex; align-items: center; justify-content: center;
+    opacity: 0; transition: opacity 2s ease, background .3s; cursor: pointer;
+    backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); }
+  #tool i { border: 7px solid transparent; border-top-width: 0; border-bottom: 11px solid rgba(246,238,226,.85);
+    transition: transform .45s cubic-bezier(.3,1.6,.5,1); }
+  #tool.carve { background: rgba(246,238,226,.14); }
+  #tool.carve i { transform: rotate(180deg); }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="veil" class="type"><h1>Orogeny</h1><p id="go">click to begin</p></div>
+<div id="hint" class="type"></div>
+<div id="tool"><i></i></div>
+<script>
+'use strict';
+/*
+  OROGENY — raise land from the sea; rain, rivers and time do the rest.
+
+  One 512² heightfield is the whole world. Per cell: bedrock height, water depth, suspended
+  sediment and vegetation. Everything else is derived from it every frame:
+    sim     flux → flow → erode   (shallow-water "virtual pipes" + sediment transport + talus)
+    derive  gradients, soft sun shadows and ambient occlusion, marched in texture space
+    render  one heightfield raymarch, shaded from those maps; then bloom, lens, grade
+    sound   the same state read back (two pixels) drives a synthesised score
+*/
+
+const N = 512;                         // grid cells; one cell is one world unit
+const $ = id => document.getElementById(id);
+const canvas = $('c');
+const gl = canvas.getContext('webgl2', { antialias: false, alpha: false, depth: false, powerPreference: 'high-performance' });
+
+function fail(msg) {
+  $('veil').style.opacity = 1;
+  $('go').style.animation = 'none';
+  $('go').textContent = msg;
+  throw new Error(msg);
+}
+if (!gl) fail('This piece needs WebGL2, which this browser does not provide.');
+const canFloat = gl.getExtension('EXT_color_buffer_float');
+if (!canFloat && !gl.getExtension('EXT_color_buffer_half_float'))
+  fail('This piece needs floating-point render targets, which this GPU does not provide.');
+
+// ───────────────────────────────────────────────────────────── maths helpers
+const clamp = (x, a, b) => Math.min(b, Math.max(a, x));
+const smooth = (a, b, x) => { const t = clamp((x - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); };
+const mix3 = (a, b, t) => a.map((v, i) => v + (b[i] - v) * t);
+const ease = (dt, tau) => 1 - Math.exp(-dt / tau);   // frame-rate independent smoothing factor
+const add = (a, b) => [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
+const sub = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+const scale = (a, s) => [a[0] * s, a[1] * s, a[2] * s];
+const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+const norm = a => scale(a, 1 / Math.hypot(a[0], a[1], a[2]));
+
+// ───────────────────────────────────────────────────────────── shaders
+const HEAD = `#version 300 es
+precision highp float; precision highp sampler2D;
+const float N = ${N}.; const int M = ${N - 1};
+uniform vec2 uSeed; uniform float uTime;
+`;
+
+// One value-noise function is the only source of randomness in the picture: it shapes the
+// first islands, the rock's hardness and strata, the uplift under the brush, the clouds
+// (and so the rain), the ripples, the foam and the canopy.
+const NOISE = `
+float hash(vec2 p){ vec3 q = fract(p.xyx*.1031); q += dot(q, q.yzx+33.33); return fract((q.x+q.y)*q.z); }
+float noise(vec2 x){
+  vec2 i = floor(x), f = fract(x); f = f*f*(3.-2.*f);
+  return mix(mix(hash(i), hash(i+vec2(1,0)), f.x), mix(hash(i+vec2(0,1)), hash(i+vec2(1,1)), f.x), f.y);
+}
+const mat2 OCT = mat2(1.6, 1.2, -1.2, 1.6);
+float fbm(vec2 x){ float a = .5, s = 0.; for(int i=0;i<5;i++){ s += a*noise(x); x = OCT*x+7.3; a *= .5; } return s; }
+float ridged(vec2 x){
+  float a = .5, s = 0.;
+  for(int i=0;i<4;i++){ float n = 1.-abs(2.*noise(x)-1.); s += a*n*n; x = OCT*x+3.1; a *= .5; }
+  return s;
+}
+// Cloud cover above world position xz. The sky, the cloud shadows and the rain all read this.
+float cloud(vec2 xz){ return smoothstep(.47, .78, fbm(xz*.0032 + uSeed + uTime*vec2(.011,.004))); }
+`;
+
+const SIM = {};
+// Virtual pipes (Mei et al. 2007): each cell pushes water to its four neighbours in proportion
+// to the difference in surface height. Flux persists between steps, which is the water's inertia.
+SIM.flux = `
+uniform sampler2D uS, uF; out vec4 o;
+float top(ivec2 q){ vec4 c = texelFetch(uS, clamp(q, ivec2(0), ivec2(M)), 0); return c.x+c.y; }
+void main(){
+  ivec2 p = ivec2(gl_FragCoord.xy);
+  vec4 c = texelFetch(uS, p, 0);
+  vec4 fall = c.x+c.y - vec4(top(p+ivec2(-1,0)), top(p+ivec2(1,0)), top(p+ivec2(0,1)), top(p+ivec2(0,-1)));
+  float g = min(.07, .2/max(c.y, 1e-4));       // cap the wave speed sqrt(g·depth) so deep lakes stay stable
+  vec4 f = max(vec4(0.), texelFetch(uF, p, 0)*.996 + g*fall);
+  o = f*min(1., c.y/(f.x+f.y+f.z+f.w+1e-9));   // never drain more water than the cell holds
+}`;
+
+SIM.flow = `
+uniform sampler2D uS, uF; layout(location=0) out vec4 oS; layout(location=1) out vec4 oV;
+vec4 F(ivec2 q){ return (q.x<0 || q.y<0 || q.x>M || q.y>M) ? vec4(0.) : texelFetch(uF, q, 0); }
+void main(){
+  ivec2 p = ivec2(gl_FragCoord.xy);
+  vec4 c = texelFetch(uS, p, 0), f = texelFetch(uF, p, 0);     // f = flux out to left, right, up, down
+  float inL = F(p+ivec2(-1,0)).y, inR = F(p+ivec2(1,0)).x, inU = F(p+ivec2(0,1)).w, inD = F(p+ivec2(0,-1)).z;
+  float d = max(c.y + inL+inR+inU+inD - f.x-f.y-f.z-f.w, 0.);
+  vec2 v = .5*vec2(inL-f.x+f.y-inR, inD-f.w+f.z-inU)/max(.5*(c.y+d), .03);
+  oS = vec4(c.x, d, c.z, c.w);
+  oV = vec4(v*min(1., 1.5/max(length(v), 1e-6)), 0, 0);
+}`;
+
+SIM.erode = NOISE + `
+uniform sampler2D uS, uV; uniform vec4 uBrush; uniform float uRain; out vec4 o;
+vec4 S(ivec2 q){ return texelFetch(uS, clamp(q, ivec2(0), ivec2(M)), 0); }
+void main(){
+  ivec2 p = ivec2(gl_FragCoord.xy); vec2 xz = gl_FragCoord.xy-.5*N;
+  vec4 c = S(p), l = S(p+ivec2(-1,0)), r = S(p+ivec2(1,0)), u = S(p+ivec2(0,1)), dn = S(p+ivec2(0,-1));
+  vec4 diag = vec4(S(p+ivec2(-1,-1)).x, S(p+ivec2(1,-1)).x, S(p+ivec2(-1,1)).x, S(p+ivec2(1,1)).x);
+  vec2 v = texelFetch(uV, p, 0).xy;
+  float b = c.x, d = c.y, veg = c.w, slope = length(.5*vec2(r.x-l.x, u.x-dn.x));
+  // Hardness varies from place to place and from layer to layer, so hard beds stand out as
+  // cliffs and ledges while soft ones slump and wash away.
+  float hard = smoothstep(.25, .75, .6*fbm(xz*.03+uSeed.yx)+.4*noise(vec2(c.x*.28, uSeed.y+xz.x*.01)));
+
+  // Sediment arrives with the current (semi-Lagrangian), then trades with the bed: fast, steep
+  // water can carry more than it holds, so it digs; slow water is overloaded, so it deposits.
+  vec2 q = gl_FragCoord.xy-.5-v; ivec2 i = ivec2(floor(q)); vec2 w = q-vec2(i);
+  float s = mix(mix(S(i).z, S(i+ivec2(1,0)).z, w.x), mix(S(i+ivec2(0,1)).z, S(i+ivec2(1,1)).z, w.x), w.y);
+  float capacity = .5*length(v)*min(d*d*30., 1.)*max(slope/sqrt(1.+slope*slope), .03);
+  float e = capacity-s;
+  e *= e>0. ? .1*(1.15-hard)*(1.-.75*veg) : .06;     // roots hold soil; hard rock resists
+  b -= e; s += e;
+
+  // Talus: material slides to any neighbour it overhangs by more than the angle of repose.
+  // All eight neighbours take part; with four, cones come out as pyramids.
+  float talus = mix(.45, 1.6, hard*hard)*(d>.25 ? .6 : 1.);
+  #define SLIP(h, run) (sign(h-b)*max(abs(h-b)-talus*run, 0.))
+  b += .07*(SLIP(l.x, 1.)+SLIP(r.x, 1.)+SLIP(u.x, 1.)+SLIP(dn.x, 1.))
+     + .05*(SLIP(diag.x, 1.414)+SLIP(diag.y, 1.414)+SLIP(diag.z, 1.414)+SLIP(diag.w, 1.414));
+
+  // The viewer's hand. Uplift is modulated by ridged noise so that land rises as ranges, not bells.
+  float border = min(min(gl_FragCoord.x, N-gl_FragCoord.x), min(gl_FragCoord.y, N-gl_FragCoord.y));
+  vec2 bd = xz-uBrush.xy;
+  float g = exp(-dot(bd,bd)/(uBrush.z*uBrush.z))*uBrush.w*smoothstep(6., 70., border);
+  b += g>0. ? g*(.3+1.6*ridged(xz*.03+3.*noise(xz*.02)+uSeed))*(1.-smoothstep(85., 112., b))
+            : g*(.6+.8*noise(xz*.09))*smoothstep(-6.5, -3.5, b);
+  veg *= 1.-min(abs(g)*2., 1.);
+
+  // It rains where clouds cross high ground; standing water above sea level slowly evaporates.
+  d += uRain*cloud(xz)*smoothstep(1., 24., b);
+  if(b+d>.35) d = max(d*.9985-.00003, 0.);
+  if(border<3.){ d = max(-b, 0.); s = 0.; }   // the open sea holds the rim at sea level
+
+  // Vegetation spreads from where it already is, onto gentle dry ground between shore and treeline.
+  float near = max(max(l.w, r.w), max(u.w, dn.w));
+  float suit = step(d, .03)*smoothstep(.3, 1.6, b)*(1.-smoothstep(34., 58., b))*(1.-smoothstep(.4, .95, slope))
+             * (.35+.65*noise(xz*.06+uSeed));
+  veg += .005*suit*(.015+near)*(1.-veg) - 20.*max(e, 0.) - .02*step(.06, d);
+  o = vec4(b, d, max(s, 0.), clamp(veg, 0., 1.));
+}`;
+
+SIM.init = NOISE + `
+out vec4 o;
+void main(){
+  vec2 xz = gl_FragCoord.xy-.5*N, q = xz/N;
+  float land = smoothstep(.44, .7, fbm(q*3.2+uSeed*3.)-.5*smoothstep(.12, .46, length(q)));
+  float b = -3.3+.9*noise(xz*.035+uSeed)+land*(4.5+44.*land*land*(ridged(xz*.022+uSeed)+.4*fbm(xz*.05)));
+  o = vec4(b, max(-b, 0.), 0., smoothstep(.5, 2., b)*(1.-smoothstep(10., 30., b))*smoothstep(.25, .6, noise(xz*.06+uSeed)));
+}`;
+
+// What the renderer samples: filterable half-float copies of the state, plus its gradients,
+// taken here at full precision (half-float heights would quantise the normals into terraces).
+SIM.derive = `
+uniform sampler2D uS, uV;
+layout(location=0) out vec4 o0; layout(location=1) out vec4 o1; layout(location=2) out vec4 o2;
+vec4 S(ivec2 q){ return texelFetch(uS, clamp(q, ivec2(0), ivec2(M)), 0); }
+void main(){
+  ivec2 p = ivec2(gl_FragCoord.xy);
+  vec4 c = S(p), l = S(p+ivec2(-1,0)), r = S(p+ivec2(1,0)), u = S(p+ivec2(0,1)), d = S(p+ivec2(0,-1));
+  vec2 v = texelFetch(uV, p, 0).xy;
+  o0 = vec4(c.x, c.y, c.w, length(v));                                        // bed, water, vegetation, speed
+  o1 = .5*vec4(r.x-l.x, u.x-d.x, r.x+r.y-l.x-l.y, u.x+u.y-d.x-d.y);           // ∇bed, ∇surface
+  o2 = vec4(v, c.z, 0.);                                                      // current, sediment
+}`;
+
+// Sun shadow and ambient occlusion for every cell, marched in the heightfield itself, so the
+// screen-space shader never casts a shadow ray. Occlusion is just "how far below the blurred
+// landscape am I", read from the mip chain.
+SIM.shadow = `
+uniform sampler2D uD0; uniform vec3 uLight; out vec4 o;
+float top(vec2 uv, float lod){ vec4 c = textureLod(uD0, uv, lod); return c.x+c.y; }
+void main(){
+  vec2 uv = gl_FragCoord.xy/N, dir = normalize(uLight.xz)/N;
+  float h = top(uv, 0.), rise = uLight.y/length(uLight.xz), sh = 1., t = 1.5;
+  for(int i=0;i<44;i++){
+    sh = min(sh, .55+12.*(h+rise*t-top(uv+dir*t, min(t*.02, 3.)))/t);   // clearance angle → penumbra
+    t += 1.+.085*t;
+  }
+  float ao = 1.-.07*max(top(uv, 3.)-h, 0.)-.035*max(top(uv, 5.)-h, 0.);
+  o = vec4(clamp(sh, 0., 1.), clamp(ao, .25, 1.), 0, 1);
+}`;
+
+const TRACE = `
+uniform sampler2D uD0;
+const float CEIL = 116., FLOOR = -7.;
+vec4 D(vec2 xz){ return textureLod(uD0, xz/N+.5, 0.); }
+float top(vec2 xz){ vec4 c = D(xz); return c.x+c.y; }
+// Heightfield march. Talus erosion bounds the terrain's slope, so (height above ground) divided
+// by the worst-case closing speed is always a safe step; a few bisections then pin the hit.
+bool trace(vec3 ro, vec3 rd, float t0, float t1, int steps, float tolerance, out float t){
+  float k = 1./max(1.8*length(rd.xz)-rd.y, .25), tp = t0; t = t0;
+  for(int i=0;i<steps;i++){
+    vec3 p = ro+rd*t; float dy = p.y-top(p.xz);
+    if(dy<tolerance*t){
+      if(dy<0.){ float a = tp, b = t; for(int j=0;j<5;j++){ t = .5*(a+b); p = ro+rd*t; if(p.y<top(p.xz)) b = t; else a = t; } }
+      else t += dy*k;
+      return true;
+    }
+    tp = t; t += max(dy*k, .3);
+    if(t>t1) break;
+  }
+  return false;
+}
+// The simulated square, then the open sea beyond it (an exact plane: the rim is held at sea level).
+bool scene(vec3 ro, vec3 rd, out float t){
+  vec3 a = (vec3(-.5*N, FLOOR, -.5*N)-ro)/rd, b = (vec3(.5*N, CEIL, .5*N)-ro)/rd, mn = min(a,b), mx = max(a,b);
+  float t0 = max(max(mn.x, mn.y), max(mn.z, 0.)), t1 = min(mx.x, min(mx.y, mx.z));
+  float sea = rd.y<0. ? -ro.y/rd.y : 1e9;
+  if(t1>t0 && t0<sea && trace(ro, rd, t0, t1, 96, .002, t)) return true;   // t0 > sea: the ray met open water first
+  t = sea; return rd.y<0.;
+}`;
+
+// Two pixels of ground truth for the CPU: where the pointer's ray lands, and the state under the brush.
+SIM.pick = TRACE + `
+uniform vec3 uRo, uRd; uniform vec2 uProbe; out vec4 o;
+void main(){
+  if(gl_FragCoord.x>1.){ o = D(uProbe); return; }
+  float t; bool hit = scene(uRo, uRd, t); vec3 p = uRo+uRd*t;
+  o = vec4(p.xz, p.y, hit ? 1. : 0.);
+}`;
+
+const RENDER = NOISE + TRACE + `
+uniform sampler2D uD1, uD2, uSh;
+uniform vec3 uRo, uCr, uCu, uCf, uLight, uLightCol, uSunDir, uSunCol, uMoonDir, uGlow, uZen, uHor;
+uniform vec2 uRes; uniform vec4 uBrush; uniform float uStars, uReflect, uFog;
+out vec4 o;
+const float DECK = 420.;   // altitude of the cloud layer
+
+vec3 air(vec3 rd){         // clear sky: a zenith-to-horizon gradient plus forward scattering round the sun
+  float mu = max(dot(rd, uSunDir), 0.), toward = .5+.5*dot(normalize(rd.xz), normalize(uSunDir.xz));
+  vec3 hor = mix(uZen*1.5+uHor*.22, uHor, toward*toward);     // warm toward the sun, cool away from it
+  return mix(hor, uZen, 1.-exp(-3.2*max(rd.y, 0.))) + uGlow*(.05*pow(mu, 6.)+.3*pow(mu, 80.))*exp(-2.*max(rd.y,0.));
+}
+vec3 sky(vec3 ro, vec3 rd){
+  vec3 c = air(rd);
+  c += uSunCol*14.*smoothstep(.99955, .9998, dot(rd, uSunDir));
+  c += uStars*vec3(.8,.88,1.)*5.*smoothstep(.9993, .9996, dot(rd, uMoonDir));
+  if(rd.y>.015){
+    vec2 at = ro.xz+rd.xz*(DECK-ro.y)/rd.y;
+    float dens = cloud(at)*smoothstep(.015, .16, rd.y);
+    if(dens>0.){
+      float lit = 1.-cloud(at+uSunDir.xz*45.);          // one tap toward the sun stands in for self-shadowing
+      vec3 cc = uHor*.5+uZen*.5 + (uSunCol*.2+uGlow*.25*pow(max(dot(rd, uSunDir), 0.), 4.))*(.25+.75*lit);
+      c = mix(c, cc, dens*.92);
+    }
+  }
+  return c;
+}
+
+// Lit ground at xz. 'under' is the depth of any water above it.
+vec3 land(vec2 xz, float dist, float under){
+  vec2 uv = xz/N+.5; vec4 c = D(xz), g = textureLod(uD1, uv, 0.), sh = textureLod(uSh, uv, 0.);
+  float b = c.x, veg = c.z, slope = length(g.xy), steep = smoothstep(.5, 1., slope);
+  float n1 = noise(xz*.31+uSeed), n2 = noise(xz*1.7);
+  float cover = smoothstep(.3, .62, veg+.35*(n2-.5))*(1.-.85*steep);
+
+  // Strata are a function of height alone, so rivers cut down through visible layers.
+  float band = fbm(vec2(b*.7+4.*noise(xz*.04), uSeed.x+.02*xz.x));
+  vec3 alb = mix(vec3(.2,.15,.125), vec3(.42,.31,.22), smoothstep(.3, .7, band));
+  alb = mix(vec3(.27,.205,.135)*(.7+.6*n1), alb, .15+.85*steep);                         // soil on gentle ground
+  alb = mix(alb, vec3(.72,.62,.45)*(.85+.3*n2), (1.-smoothstep(.5, 2.8, b))*(1.-steep));       // sand by the sea
+  alb = mix(alb, mix(vec3(.2,.26,.07), vec3(.06,.125,.04), smoothstep(.5, 1., veg+.3*(n1-.5))), cover);
+  float snow = smoothstep(58., 68., b+10.*n1-16.*slope);
+  alb = mix(alb, vec3(.8,.85,.92), snow);
+  alb *= 1.-.45*clamp(smoothstep(0., .05, c.y)+under*4., 0., 1.);                         // wet ground is darker
+
+  // Small-scale relief the grid cannot hold: rock grain, or a bumpier canopy where it is wooded.
+  vec2 q = xz*mix(.9, 2.3, cover); const vec2 e = vec2(.35, 0);
+  vec2 bump = vec2(noise(q+e)-noise(q-e), noise(q+e.yx)-noise(q-e.yx))*mix(.5+steep, 1.8, cover)*(1.-.8*snow)/(1.+dist*.0025);
+  vec3 n = normalize(vec3(-g.x-bump.x, 1., -g.y-bump.y));
+
+  float caustic = 1.;
+  if(under>0.){
+    float k = noise(xz*.8+uTime*vec2(.3,.2))-noise(xz*.8-uTime*vec2(.25,.35)+9.);
+    caustic = 1.+1.6*pow(1.-abs(k), 9.)*exp(-.5*under);
+  }
+  float cloudShade = 1.-.75*cloud(xz+uLight.xz*(DECK-b)/max(uLight.y, .08));
+  vec3 direct = uLightCol*max(dot(n, uLight), 0.)*sh.x*cloudShade*caustic;
+  vec3 ambient = mix(uHor*.22+alb*uLightCol*.05, uZen*.75+uHor*.3, .5+.5*n.y)*sh.y;
+  return alb*(direct+ambient);
+}
+
+vec3 shade(vec3 ro, vec3 rd, float t){
+  vec3 p = ro+rd*t; vec2 uv = p.xz/N+.5; vec4 c = D(p.xz);
+  float wet = smoothstep(.008, .06, c.y);
+  vec3 col = wet<1. ? land(p.xz, t, 0.) : vec3(0.);
+  if(wet>0.){
+    vec4 g = textureLod(uD1, uv, 0.), f = textureLod(uD2, uv, 0.), sh = textureLod(uSh, uv, 0.);
+    float d = c.y;
+    // Wind ripples ride on the simulated surface, whose own slope carries the swells and wakes.
+    float chop = 1./(1.+t*.004);
+    #define W(q) (noise((q)*.13+uTime*vec2(.2,.12))+chop*(.3*noise((q)*.4-uTime*vec2(.3,.4))+.12*noise((q)*1.1+uTime*vec2(.5,-.3))))
+    vec2 q = p.xz; const vec2 e = vec2(.5, 0);
+    vec2 rip = vec2(W(q+e)-W(q-e), W(q+e.yx)-W(q-e.yx))*.35*smoothstep(0., 1.2, d);
+    vec3 n = normalize(vec3(-g.z-rip.x, 1., -g.w-rip.y));
+
+    float fres = .02+.98*pow(1.-max(dot(-rd, n), 0.), 5.);
+    vec3 rr = reflect(rd, n); rr.y = abs(rr.y)+.002;
+    vec3 refl = sky(p, rr); float tr;
+    if(uReflect>.5 && trace(p+vec3(0,.15,0), rr, 1., 260., 28, 0., tr)) refl = land(p.xz+rr.xz*tr, t+tr, 0.);
+
+    // Looking in: refract to the bed, then absorb red first (Beer's law) so shallows go turquoise
+    // and depths go blue. Sediment in suspension turns the water opaque and brown.
+    vec3 rf = refract(rd, n, .75); float slant = 1./max(-rf.y, .3);
+    vec2 bx = p.xz+rf.xz*d*slant*.5; float du = D(bx).y, path = .5*(d+du)*slant;
+    float silt = min(f.z*22., 1.);
+    vec3 ext = exp(-path*mix(vec3(2.,.55,.36), vec3(1.8,2.2,2.8), silt));
+    float lit = sh.x*(1.-.75*cloud(p.xz+uLight.xz*DECK/max(uLight.y, .08)));
+    vec3 inLight = uLightCol*max(uLight.y, 0.)*lit*.45+uZen*.6+uHor*.25;
+    vec3 body = land(bx, t, du)*ext + mix(vec3(.002,.035,.06), vec3(.3,.21,.11), silt)*inLight*(1.-ext);
+    vec3 w = mix(body, refl, fres) + uLightCol*lit*3.5*pow(max(dot(rr, uLight), 0.), 500.)*(1.-smoothstep(.1, .5, length(g.zw)));
+
+    // White water where the current is fast, and surf where the sea meets a beach. The foam
+    // texture is carried by the current in two half-offset phases, so it flows without smearing.
+    float ph = fract(uTime*.4); vec2 fl = f.xy*9.;
+    float fn = mix(noise(p.xz*1.4-fl*ph), noise(p.xz*1.4-fl*fract(ph+.5)+5.), abs(1.-2.*ph));
+    float rapids = smoothstep(.45, 1.1, c.w)*(1.-smoothstep(.3, 2., d))*smoothstep(.04, .2, d);
+    float surf = (1.-smoothstep(.03, .5, d))*step(c.x+d, .6)*(.55+.45*sin(uTime*1.1+6.*noise(p.xz*.06)+d*9.));
+    float foam = smoothstep(.55, .9, .5*fn+max(rapids, surf));
+    w = mix(w, vec3(.8,.84,.86)*(inLight+uLightCol*lit*.15), foam*.9);
+    w += uStars*vec3(.03,.5,.6)*(foam+smoothstep(.03, .3, c.w)*(.3+.7*fn));     // at night, disturbed water glows
+    col = mix(col, w, wet);
+  }
+  float ring = length(p.xz-uBrush.xy)/uBrush.z;
+  col += vec3(1.,.8,.55)*uBrush.w*(.5*(1.-smoothstep(0., .05, abs(ring-1.2)))+.1*exp(-ring*ring))*(.25+.2*uLightCol.r);
+  return mix(col, air(normalize(vec3(rd.x, .035, rd.z))), 1.-exp(-t*uFog));    // aerial perspective
+}
+
+void main(){
+  vec2 s = (gl_FragCoord.xy*2.-uRes)/uRes;
+  vec3 rd = normalize(uCf+uCr*s.x+uCu*s.y);
+  float t; bool hit = scene(uRo, rd, t);
+  if(hit){ o = vec4(shade(uRo, rd, t), t); return; }
+  vec3 c = sky(uRo, rd);
+  if(uStars>0.){                                   // one star in some cells of a grid laid over the dome
+    vec2 s = rd.xz/(rd.y+.4)*120., id = floor(s); float h = hash(id);
+    vec2 at = fract(s)-.5-.6*(vec2(hash(id+7.), hash(id+13.))-.5);
+    c += uStars*vec3(.8,.88,1.)*step(.94, h)*(h-.93)*60.*(1.-smoothstep(0., .16, length(at)))*smoothstep(0., .1, rd.y)*(1.-cloud(uRo.xz+rd.xz*(DECK-uRo.y)/max(rd.y, .02)));
+  }
+  o = vec4(c, 0.);                                 // depth 0 marks sky: the lens leaves it sharp
+}`;
+
+const POST = {};
+// Shared by every bloom pass: a 4-tap box whose taps sit between texels, so each is itself a 2×2 average.
+POST.blur = `
+uniform sampler2D uT; uniform vec2 uRes; uniform float uSpread, uKnee; out vec4 o;
+void main(){
+  vec2 uv = gl_FragCoord.xy/uRes, d = uSpread/uRes;
+  vec3 c = .25*(texture(uT, uv+d).rgb+texture(uT, uv-d).rgb+texture(uT, uv+vec2(d.x,-d.y)).rgb+texture(uT, uv+vec2(-d.x,d.y)).rgb);
+  if(uKnee>0.){ float l = max(c.r, max(c.g, c.b)); c = min(c*max(l-uKnee, 0.)/max(l, 1e-4), vec3(30.)); }
+  o = vec4(c, 1);
+}`;
+
+// The lens: a shallow depth of field (which is what makes it read as a model you could touch),
+// bloom, exposure, filmic tone curve and grade. Luma goes to alpha for the anti-aliasing pass.
+POST.lens = `
+uniform sampler2D uScene, uBloom; uniform vec2 uRes; uniform float uFocus, uExposure; out vec4 o;
+void main(){
+  vec2 uv = gl_FragCoord.xy/uRes; vec4 c = texture(uScene, uv);
+  float coc = c.a>0. ? clamp(abs(uFocus/c.a-1.)*1.5-.12, 0., 1.)*min(uRes.x, uRes.y)/170. : 0.;
+  vec3 col = c.rgb;
+  if(coc>.5){
+    for(int i=0;i<8;i++){   // golden-angle disc
+      float a = float(i)*2.4; col += texture(uScene, uv+vec2(cos(a), sin(a))*sqrt((float(i)+.5)/8.)*coc/uRes).rgb;
+    }
+    col /= 9.;
+  }
+  col = (col+texture(uBloom, uv).rgb*.045)*uExposure;
+  col = clamp(col*(2.51*col+.03)/(col*(2.43*col+.59)+.14), 0., 1.);            // ACES fit (Narkowicz)
+  float l = dot(col, vec3(.2126,.7152,.0722));
+  col = mix(col, col*vec3(.94,1.,1.1), 1.-smoothstep(0., .4, l));              // cool shadows
+  col = mix(col, col*vec3(1.05,1.,.93), smoothstep(.45, 1., l));               // warm highlights
+  col = pow(col, vec3(1./2.2));
+  o = vec4(col, dot(col, vec3(.299,.587,.114)));
+}`;
+
+POST.present = `
+uniform sampler2D uImg; uniform vec2 uRes, uSrc; uniform float uVeil; out vec4 o;
+float hash(vec2 p){ vec3 q = fract(p.xyx*.1031); q += dot(q, q.yzx+33.33); return fract((q.x+q.y)*q.z); }
+void main(){
+  vec2 uv = gl_FragCoord.xy/uRes, px = 1./uSrc;
+  // FXAA (Lottes' console variant): blur along the local edge direction found from luma.
+  float lNW = texture(uImg, uv+vec2(-1,-1)*px).a, lNE = texture(uImg, uv+vec2(1,-1)*px).a,
+        lSW = texture(uImg, uv+vec2(-1,1)*px).a,  lSE = texture(uImg, uv+vec2(1,1)*px).a, lM = texture(uImg, uv).a;
+  float lo = min(lM, min(min(lNW,lNE), min(lSW,lSE))), hi = max(lM, max(max(lNW,lNE), max(lSW,lSE)));
+  vec2 dir = vec2(lSW+lSE-lNW-lNE, lNW+lSW-lNE-lSE);
+  dir = clamp(dir/(min(abs(dir.x), abs(dir.y))+max((lNW+lNE+lSW+lSE)*.03, .008)), -8., 8.)*px;
+  vec4 a = .5*(texture(uImg, uv-dir/6.)+texture(uImg, uv+dir/6.));
+  vec4 b = .5*a+.25*(texture(uImg, uv-dir*.5)+texture(uImg, uv+dir*.5));
+  vec3 col = (b.a<lo || b.a>hi) ? a.rgb : b.rgb;
+  vec2 v = uv-.5;
+  col *= 1.-(.55+.5*uVeil)*smoothstep(.25, .95, length(v*vec2(1.,.85)));       // vignette
+  // Grain at native resolution: it dithers away banding and hides the upscale.
+  float gr = hash(gl_FragCoord.xy+fract(uTime*7.31)*vec2(311.,173.))+hash(gl_FragCoord.yx+fract(uTime*5.17)*vec2(97.,211.))-1.;
+  o = vec4(col+gr*(.012+.028*(1.-dot(col, vec3(.33)))), 1);
+}`;
+
+// ───────────────────────────────────────────────────────────── GL plumbing
+const VERTEX = `#version 300 es
+void main(){ gl_Position = vec4(vec2((gl_VertexID<<1)&2, gl_VertexID&2)*2.-1., 0, 1); }`;   // one big triangle
+
+function compile(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) { console.error(gl.getShaderInfoLog(s)); fail('A shader failed to compile on this GPU.'); }
+  return s;
+}
+const vertexShader = compile(gl.VERTEX_SHADER, VERTEX);
+function program(body) {
+  const id = gl.createProgram(), u = {};
+  gl.attachShader(id, vertexShader); gl.attachShader(id, compile(gl.FRAGMENT_SHADER, HEAD + body));
+  gl.linkProgram(id);
+  if (!gl.getProgramParameter(id, gl.LINK_STATUS)) { console.error(gl.getProgramInfoLog(id)); fail('A shader failed to link on this GPU.'); }
+  for (let i = gl.getProgramParameter(id, gl.ACTIVE_UNIFORMS); i--;) {
+    const name = gl.getActiveUniform(id, i).name; u[name] = gl.getUniformLocation(id, name);
+  }
+  return { id, u };
+}
+function texture(w, h, format, filter, levels = 1) {
+  const t = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texStorage2D(gl.TEXTURE_2D, levels, format, w, h);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, levels > 1 ? gl.LINEAR_MIPMAP_LINEAR : filter);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  return Object.assign(t, { w, h });
+}
+function target(...textures) {      // a framebuffer drawing into one or more same-sized textures
+  const fbo = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+  textures.forEach((t, i) => gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0 + i, gl.TEXTURE_2D, t, 0));
+  gl.drawBuffers(textures.map((_, i) => gl.COLOR_ATTACHMENT0 + i));
+  return { fbo, w: textures[0].w, h: textures[0].h, tex: textures[0] };
+}
+// Run a fragment program over a target. Uniform kinds are inferred from the values passed.
+function draw(prog, to, uniforms) {
+  gl.bindFramebuffer(gl.FRAMEBUFFER, to ? to.fbo : null);
+  gl.viewport(0, 0, to ? to.w : canvas.width, to ? to.h : canvas.height);
+  gl.useProgram(prog.id);
+  let unit = 0;
+  for (const name in uniforms) {
+    const loc = prog.u[name], v = uniforms[name];
+    if (loc === undefined) continue;
+    if (v instanceof WebGLTexture) { gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_2D, v); gl.uniform1i(loc, unit++); }
+    else if (typeof v === 'number') gl.uniform1f(loc, v);
+    else gl['uniform' + v.length + 'fv'](loc, v);
+  }
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+}
+
+const P = {};
+for (const k in SIM) P[k] = program(SIM[k]);
+P.render = program(RENDER);
+for (const k in POST) P[k] = program(POST[k]);
+
+// Simulation state wants full floats (erosion adds very small numbers to large ones).
+const SIMF = canFloat ? gl.RGBA32F : gl.RGBA16F;
+const simTex = () => texture(N, N, SIMF, gl.NEAREST);
+const stateA = simTex(), stateB = simTex(), velocity = simTex();
+let fluxes = [target(simTex()), target(simTex())];
+const toStateA = target(stateA), toFlow = target(stateB, velocity);
+const MIPS = Math.log2(N) + 1;
+const D0 = texture(N, N, gl.RGBA16F, gl.LINEAR, MIPS), D1 = texture(N, N, gl.RGBA16F, gl.LINEAR), D2 = texture(N, N, gl.RGBA16F, gl.LINEAR);
+const toDerived = target(D0, D1, D2), toShadow = target(texture(N, N, gl.RGBA8, gl.LINEAR));
+const toPick = target(texture(2, 1, SIMF, gl.NEAREST));
+const toStats = { fbo: gl.createFramebuffer() };      // the 1×1 top of D0's mip chain is the world's average
+gl.bindFramebuffer(gl.FRAMEBUFFER, toStats.fbo);
+gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, D0, MIPS - 1);
+
+// ───────────────────────────────────────────────────────────── world state
+let seed = parseInt(location.hash.slice(1), 36);
+if (!(seed > 0)) seed = 1 + Math.floor(Math.random() * 36 ** 4);
+let seedVec, time = 0, started = false, idle = 0;
+const world = { h: 0, water: 0, veg: 0, speed: 0, meanH: -3, meanVeg: 0, meanSpeed: 0 };   // read back from the GPU
+const brush = { x: 0, z: 0, tx: 0, tz: 0, s: 0, radius: 20, glow: 0 };
+const cam = { az: 0, el: .2, dist: 590, azT: 0, elT: .2, distT: 590, drift: 1 };
+const sun = { phase: -.45, light: [0, 1, 0] };        // phase −0.45 is early golden hour, sun rising
+
+function newWorld(s) {
+  seed = s;
+  try { history.replaceState(null, '', '#' + seed.toString(36)); } catch (e) {}
+  seedVec = [(seed % 997) * .731, (Math.floor(seed / 997) % 991) * .517];
+  draw(P.init, toStateA, { uSeed: seedVec, uTime: 0 });
+  for (const f of fluxes) { gl.bindFramebuffer(gl.FRAMEBUFFER, f.fbo); gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT); }
+  cam.az = cam.azT = sun.phase * .5 + 1 + seed % 6 + .7 - Math.PI;   // open looking toward the light, a little off axis
+  warmup = 240;
+}
+let warmup = 0;   // extra steps on a fresh world, so its first rivers are already cut when the veil lifts
+
+const STEPS_PER_SECOND = 150;
+let stepDebt = 0;
+function simulate(dt) {
+  stepDebt = Math.min(stepDebt + dt * STEPS_PER_SECOND, 5);
+  let steps = Math.floor(stepDebt); stepDebt -= steps;
+  if (warmup > 0) { steps += 6; warmup -= 6; }
+  const common = { uSeed: seedVec, uTime: time };
+  for (let i = 0; i < steps; i++) {
+    draw(P.flux, fluxes[1], { uS: stateA, uF: fluxes[0].tex }); fluxes.reverse();
+    draw(P.flow, toFlow, { uS: stateA, uF: fluxes[0].tex });
+    draw(P.erode, toStateA, { ...common, uS: stateB, uV: velocity, uRain: .0045,
+      uBrush: [brush.x, brush.z, brush.radius, brush.s * .14] });
+  }
+  draw(P.derive, toDerived, { uS: stateA, uV: velocity });
+  gl.bindTexture(gl.TEXTURE_2D, D0); gl.generateMipmap(gl.TEXTURE_2D);
+  draw(P.shadow, toShadow, { uD0: D0, uLight: sun.light });
+}
+
+// ───────────────────────────────────────────────────────────── sky and light
+// A day lasts about six and a half minutes. Colours are keyed on the sun's elevation.
+const MOON = norm([.5, .62, -.6]);
+function updateSky(dt) {
+  // Time lingers at dawn and dusk, where the light is best, and hurries through noon and midnight.
+  const pace = .3 + 1.8 * smooth(.25, .65, sun.dir ? sun.dir[1] : 0) + 1.2 * (sun.night || 0);
+  sun.phase += dt * (keys.t ? 30 : 1) * pace * 2 * Math.PI / 400;
+  const el = (20 + 30 * Math.sin(sun.phase)) * Math.PI / 180, az = sun.phase * .5 + 1 + seed % 6;
+  const sE = Math.sin(el), high = smooth(.2, .7, sE), dusk = smooth(-.17, .04, sE), night = smooth(.0, -.16, sE);
+  sun.dir = [Math.cos(el) * Math.sin(az), sE, Math.cos(el) * Math.cos(az)];
+  sun.col = scale(mix3([1, .4, .13], [1, .93, .82], high), 5.5 * smooth(-.035, .06, sE));
+  // Below the horizon the moon takes over as the key light; both are black at the hand-over.
+  const moonUp = sE < -.045;
+  sun.light = moonUp ? MOON : norm([sun.dir[0], Math.max(sE, .03), sun.dir[2]]);
+  sun.lightCol = moonUp ? scale([.38, .5, .75], .7 * smooth(-.055, -.16, sE)) : sun.col;
+  sun.zen = mix3(mix3([.004, .009, .026], [.07, .13, .34], dusk), [.055, .19, .55], high);
+  sun.hor = mix3(mix3([.014, .024, .06], [.85, .43, .2], dusk), [.42, .6, .86], high);
+  sun.glow = scale(mix3([1, .34, .1], [1, .82, .62], high), smooth(-.22, -.02, sE) * (1.5 - high));
+  sun.night = night;
+  sun.exposure = .82 + 1.3 * night;
+  sun.fog = .00022 - .0001 * high;
+}
+
+// ───────────────────────────────────────────────────────────── camera
+function updateCamera(dt) {
+  const turn = (keys.arrowleft || keys.a ? 1 : 0) - (keys.arrowright || keys.d ? 1 : 0);
+  const tilt = (keys.arrowup || keys.w ? 1 : 0) - (keys.arrowdown || keys.s ? 1 : 0);
+  cam.drift += ((gesture || turn ? 0 : 1) - cam.drift) * ease(dt, 2.5);   // hold still while a hand is on the world
+  cam.azT += dt * (turn * 1.3 + cam.drift * .022);
+  cam.elT = clamp(cam.elT + tilt * dt * .8, .09, 1.25);
+  cam.distT = clamp(cam.distT, 230, 1150);
+  const k = ease(dt, .16);
+  cam.az += (cam.azT - cam.az) * k; cam.el += (cam.elT - cam.el) * k; cam.dist += (cam.distT - cam.dist) * k;
+  const focus = [0, 36, 0], ce = Math.cos(cam.el);
+  cam.pos = add(focus, scale([ce * Math.sin(cam.az), Math.sin(cam.el), ce * Math.cos(cam.az)], cam.dist));
+  const f = norm(sub(focus, cam.pos)), r = norm(cross(f, [0, 1, 0])), aspect = canvas.width / canvas.height;
+  const tanV = .29 * Math.max(1, 1.25 / aspect);     // a long lens; widen on portrait screens to keep the islands in frame
+  cam.f = f; cam.r = scale(r, tanV * aspect); cam.u = scale(cross(r, f), tanV);
+}
+const pointerRay = () => norm(add(cam.f, add(scale(cam.r, pointer.x / innerWidth * 2 - 1), scale(cam.u, 1 - pointer.y / innerHeight * 2))));
+
+// ───────────────────────────────────────────────────────────── input
+// One finger or the left button sculpts where it lands on the world, and turns the camera where
+// it lands on sky or open sea. Which of the two is decided by the GPU pick on the next frame.
+const pointer = { x: innerWidth / 2, y: innerHeight / 2, hover: false, carve: false, anchorY: 0 };
+const touches = new Map(), keys = {}, tool = $('tool');
+let gesture = null, pinch = 0;     // null | 'pending' | 'sculpt' | 'orbit' | 'pinch'
+const carving = () => pointer.carve || keys.shift || tool.classList.contains('carve');
+const spread = () => { const [a, b] = [...touches.values()]; return Math.hypot(a.x - b.x, a.y - b.y); };
+
+canvas.addEventListener('pointerdown', e => {
+  try { canvas.setPointerCapture(e.pointerId); } catch (err) {}
+  touches.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  if (!started) begin(e.pointerType);
+  idle = 0;
+  if (touches.size === 1) {
+    Object.assign(pointer, { x: e.clientX, y: e.clientY, carve: e.button === 2 });
+    gesture = 'pending';
+  } else { gesture = 'pinch'; pinch = spread(); }
+});
+canvas.addEventListener('pointermove', e => {
+  const p = touches.get(e.pointerId);
+  idle = 0;
+  if (!p) { Object.assign(pointer, { x: e.clientX, y: e.clientY, hover: e.pointerType === 'mouse' }); return; }
+  const dx = e.clientX - p.x, dy = e.clientY - p.y;
+  p.x = e.clientX; p.y = e.clientY;
+  if (gesture === 'pinch' && touches.size > 1) {
+    const s = spread(); cam.distT *= pinch / s; pinch = s;
+    cam.azT -= dx * .003; cam.elT += dy * .003;
+  } else {
+    pointer.x = e.clientX; pointer.y = e.clientY;
+    if (gesture === 'orbit') { cam.azT -= dx * .0055; cam.elT += dy * .0045; }
+  }
+});
+const release = e => { touches.delete(e.pointerId); gesture = touches.size ? 'orbit' : null; };
+canvas.addEventListener('pointerup', release);
+canvas.addEventListener('pointercancel', release);
+canvas.addEventListener('pointerleave', () => { pointer.hover = false; });
+canvas.addEventListener('contextmenu', e => e.preventDefault());
+canvas.addEventListener('wheel', e => { e.preventDefault(); idle = 0; cam.distT *= Math.exp(e.deltaY * .0012); }, { passive: false });
+tool.addEventListener('click', () => tool.classList.toggle('carve'));
+addEventListener('keydown', e => {
+  const k = e.key.toLowerCase(); keys[k] = true; idle = 0;
+  if (!started) return begin('mouse');
+  if (k === ' ') tool.classList.toggle('carve');
+  if (k === 'n') newWorld(1 + Math.floor(Math.random() * 36 ** 4));
+  if (k === 'm' && audio.out) audio.out.gain.setTargetAtTime((audio.muted = !audio.muted) ? 0 : .9, audio.ac.currentTime, .2);
+});
+addEventListener('keyup', e => { keys[e.key.toLowerCase()] = false; });
+addEventListener('blur', () => { for (const k in keys) keys[k] = false; });
+
+function begin(kind) {
+  started = true;
+  startAudio();
+  $('veil').style.opacity = 0;
+  const hint = $('hint');
+  hint.textContent = kind === 'touch' ? 'drag to raise land  ·  tap the arrow to carve  ·  two fingers to turn'
+                                      : 'drag to raise land  ·  shift-drag to carve  ·  drag the sky to turn';
+  hint.style.opacity = .85; tool.style.opacity = .8;
+  setTimeout(() => { hint.style.opacity = 0; }, 11000);
+}
+
+// When nobody is here, an unseen hand keeps working, so the piece is never a still.
+const ghost = { next: 3, until: 0, x: 0, z: 0, vx: 0, vz: 0, sign: 1 };
+function haunt(dt) {
+  if (time > ghost.next) {
+    const a = Math.random() * 6.283, r = 40 + 130 * Math.sqrt(Math.random()), b = Math.random() * 6.283;
+    const dur = 2 + 3 * Math.random();
+    // Keep land and sea in rough balance over hours of idling.
+    const sign = world.meanH > 2.5 ? -1 : world.meanH < -1 ? 1 : Math.random() < .75 ? 1 : -1;
+    Object.assign(ghost, { x: Math.cos(a) * r, z: Math.sin(a) * r, vx: Math.cos(b) * 26, vz: Math.sin(b) * 26, sign,
+      until: time + dur, next: time + dur + 2.5 + 5 * Math.random() });
+  }
+  if (time > ghost.until) return 0;
+  ghost.x += ghost.vx * dt; ghost.z += ghost.vz * dt;
+  brush.tx = ghost.x; brush.tz = ghost.z;
+  return ghost.sign;
+}
+
+const pickBuf = new Float32Array(8), statBuf = new Float32Array(4);
+let frameCount = 0;
+function updateBrush(dt) {
+  // Ask the GPU where the pointer's ray lands and what lies under the brush.
+  const ro = cam.pos, rd = pointerRay();
+  draw(P.pick, toPick, { uD0: D0, uRo: ro, uRd: rd, uProbe: [brush.x, brush.z] });
+  gl.readPixels(0, 0, 2, 1, gl.RGBA, gl.FLOAT, pickBuf);
+  const inside = pickBuf[3] > 0 && Math.max(Math.abs(pickBuf[0]), Math.abs(pickBuf[1])) < N / 2 - 4;
+  Object.assign(world, { h: pickBuf[4], water: pickBuf[5], veg: pickBuf[6], speed: pickBuf[7] });
+  if (frameCount++ % 20 === 0) {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, toStats.fbo);
+    gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.FLOAT, statBuf);
+    Object.assign(world, { meanH: statBuf[0], meanVeg: statBuf[2], meanSpeed: statBuf[3] });
+  }
+
+  if (gesture === 'pending') {
+    gesture = inside ? 'sculpt' : 'orbit';
+    pointer.anchorY = pickBuf[2];
+    if (inside) { brush.x = brush.tx = pickBuf[0]; brush.z = brush.tz = pickBuf[1]; }
+  }
+  let want = 0, glow = 0;
+  if (gesture === 'sculpt') {
+    // Drag along the horizontal plane through the first touch: the land rising under the
+    // pointer must not pull the brush toward the camera.
+    const t = (pointer.anchorY - ro[1]) / Math.min(rd[1], -.02);
+    brush.tx = clamp(ro[0] + rd[0] * t, -N / 2, N / 2); brush.tz = clamp(ro[2] + rd[2] * t, -N / 2, N / 2);
+    want = carving() ? -1 : 1; glow = 1;
+  } else if (idle > 16 || !started) want = haunt(dt);
+  else if (pointer.hover && !gesture && inside) { brush.tx = pickBuf[0]; brush.tz = pickBuf[1]; glow = .35; }
+
+  // The hand has mass: it eases in, and the land keeps moving for a moment after letting go.
+  const k = ease(dt, want || glow ? .07 : 1e-3);
+  brush.x += (brush.tx - brush.x) * k; brush.z += (brush.tz - brush.z) * k;
+  brush.s += (want - brush.s) * ease(dt, Math.abs(want) > Math.abs(brush.s) ? .14 : .32);
+  brush.glow += (Math.max(glow, Math.abs(brush.s)) - brush.glow) * ease(dt, .2);
+  brush.radius = 9 + cam.dist * .021;            // zoom in for finer work
+}
+
+// ───────────────────────────────────────────────────────────── adaptive resolution
+// The picture is rendered at a fraction of the canvas and scaled so that frames never drop.
+const view = { scale: 0, ema: 1 / 60, timer: 0, calm: 0, ceiling: 1 };
+function resize() {
+  const dpr = Math.min(devicePixelRatio || 1, 2);
+  canvas.width = Math.round(innerWidth * dpr); canvas.height = Math.round(innerHeight * dpr);
+  if (!view.scale) view.scale = clamp(Math.sqrt(6e5 / (canvas.width * canvas.height)), .3, 1);   // start modest, then climb
+  buildTargets();
+}
+function buildTargets() {
+  for (const t of view.targets || []) { gl.deleteTexture(t.tex); gl.deleteFramebuffer(t.fbo); }
+  const w = Math.max(2, Math.round(canvas.width * view.scale)), h = Math.max(2, Math.round(canvas.height * view.scale));
+  view.scene = target(texture(w, h, gl.RGBA16F, gl.LINEAR));
+  view.ldr = target(texture(w, h, gl.RGBA8, gl.LINEAR));
+  view.bloom = [1, 2, 3, 4, 5].map(i => target(texture(Math.max(1, w >> i), Math.max(1, h >> i), gl.RGBA16F, gl.LINEAR)));
+  view.targets = [view.scene, view.ldr, ...view.bloom];
+}
+function adapt(dt) {
+  if (dt > .1) return;                           // a hitch or a tab switch says nothing about the GPU
+  view.ema += (dt - view.ema) * .06; view.timer += dt; view.calm += dt;
+  if (view.timer < .7) return;
+  view.timer = 0;
+  let s = view.scale;
+  if (view.ema > 1 / 50) { s *= .84; view.ceiling = s; view.calm = 0; }
+  else if (view.ema > 1 / 56) { s *= .93; view.ceiling = s; view.calm = 0; }
+  else if (view.calm > 1.4) { s *= 1.1; view.ceiling = Math.min(1, view.ceiling * 1.004); }   // probe upward, remembering what failed
+  s = clamp(Math.min(s, view.ceiling), .3, 1);
+  if (Math.abs(s - view.scale) > .01) { view.scale = s; buildTargets(); }
+}
+addEventListener('resize', resize);
+
+function render() {
+  const { scene, ldr, bloom } = view, res = [scene.w, scene.h];
+  draw(P.render, scene, {
+    uSeed: seedVec, uTime: time, uD0: D0, uD1: D1, uD2: D2, uSh: toShadow.tex, uRes: res,
+    uRo: cam.pos, uCr: cam.r, uCu: cam.u, uCf: cam.f,
+    uLight: sun.light, uLightCol: sun.lightCol, uSunDir: sun.dir, uSunCol: sun.col, uMoonDir: MOON,
+    uGlow: sun.glow, uZen: sun.zen, uHor: sun.hor, uStars: sun.night, uFog: sun.fog,
+    uReflect: view.scale > .45 ? 1 : 0,
+    uBrush: [brush.x, brush.z, brush.radius, brush.glow * .55],
+  });
+  // Bloom: threshold, walk down a pyramid, then add each level back into the one above.
+  let src = scene;
+  bloom.forEach((b, i) => { draw(P.blur, b, { uT: src.tex, uRes: [b.w, b.h], uSpread: .5, uKnee: i ? 0 : 1.1 }); src = b; });
+  gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE);
+  for (let i = bloom.length - 1; i > 0; i--)
+    draw(P.blur, bloom[i - 1], { uT: bloom[i].tex, uRes: [bloom[i - 1].w, bloom[i - 1].h], uSpread: 1, uKnee: 0 });
+  gl.disable(gl.BLEND);
+  draw(P.lens, ldr, { uScene: scene.tex, uBloom: bloom[0].tex, uRes: res, uFocus: cam.dist, uExposure: sun.exposure });
+  draw(P.present, null, { uTime: time, uImg: ldr.tex, uRes: [canvas.width, canvas.height], uSrc: res, uVeil: started ? 0 : 1 });
+}
+
+// ───────────────────────────────────────────────────────────── sound
+// Everything is synthesised from oscillators and one buffer of white noise. The mix is driven
+// by the simulation: the sea and wind are always there; currents hiss; the earth rumbles under
+// the hand and sings a pentatonic scale as it passes through heights; birds arrive with the trees.
+const audio = {};
+const PENTATONIC = [0, 2, 4, 7, 9];
+const noteAt = step => audio.root * 2 ** ((PENTATONIC[((step % 5) + 5) % 5] + 12 * Math.floor(step / 5)) / 12);
+
+function startAudio() {
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if (!AC || audio.ac) return;
+  const ac = audio.ac = new AC(), out = audio.out = ac.createGain();
+  out.gain.value = 0; out.gain.setTargetAtTime(.9, ac.currentTime, 1.2);
+  out.connect(ac.createDynamicsCompressor()).connect(ac.destination);
+  audio.root = 110 * 2 ** ([0, 2, 3, 5, 7][seed % 5] / 12);
+
+  // Reverb: convolve with noise that decays and darkens, which is what a large space does to a click.
+  const len = ac.sampleRate * 4 | 0, impulse = ac.createBuffer(2, len, ac.sampleRate);
+  for (let ch = 0; ch < 2; ch++) {
+    const data = impulse.getChannelData(ch); let low = 0;
+    for (let i = 0; i < len; i++) { const t = i / len; low += (Math.random() * 2 - 1 - low) * (1 - .93 * Math.sqrt(t)); data[i] = low * (1 - t) ** 3.5; }
+  }
+  audio.verb = ac.createConvolver(); audio.verb.buffer = impulse;
+  const wet = ac.createGain(); wet.gain.value = .55; audio.verb.connect(wet).connect(out);
+
+  const hiss = ac.createBuffer(1, ac.sampleRate * 3, ac.sampleRate), data = hiss.getChannelData(0);
+  for (let i = 0; i < data.length; i++) data[i] = Math.random() * 2 - 1;
+  const layer = (type, freq, q) => {       // looping noise through one filter and a gain
+    const src = ac.createBufferSource(), f = ac.createBiquadFilter(), g = ac.createGain();
+    src.buffer = hiss; src.loop = true; src.playbackRate.value = .8 + .4 * Math.random();
+    f.type = type; f.frequency.value = freq; f.Q.value = q; g.gain.value = 0;
+    src.connect(f).connect(g).connect(out); src.start();
+    return { f: f.frequency, g: g.gain };
+  };
+  audio.sea = layer('lowpass', 400, .4); audio.wind = layer('bandpass', 650, .7);
+  audio.water = layer('bandpass', 2600, .6); audio.rumble = layer('lowpass', 85, 1.5);
+
+  const voice = (type, freq, gain, dest) => {
+    const o = ac.createOscillator(), g = ac.createGain();
+    o.type = type; o.frequency.value = freq; g.gain.value = gain; o.connect(g).connect(dest); o.start();
+    return { f: o.frequency, g: g.gain };
+  };
+  audio.sub = voice('sine', 41, 0, out);
+  // The earth's voice: a soft tone two octaves under the current note, heard only while sculpting.
+  const mellow = ac.createBiquadFilter(); mellow.frequency.value = 500; mellow.connect(out); mellow.connect(audio.verb);
+  audio.earth = voice('triangle', audio.root, 0, mellow);
+  // A slow pad of four voices drifting between chords of the same scale.
+  const pad = audio.padFilter = ac.createBiquadFilter(); pad.frequency.value = 500; pad.Q.value = .4;
+  pad.connect(out); pad.connect(audio.verb);
+  audio.pad = [0, 7, 16, 19].map((s, i) => voice(i % 2 ? 'triangle' : 'sawtooth', audio.root * 2 ** (s / 12) * (1 + (i - 1.5) * .0015), .013, pad));
+  audio.nextChord = audio.nextNote = 0; audio.step = 0;
+}
+
+function pluck(freq, level, pan, decay) {      // a bell: a sine and one inharmonic partial that dies faster
+  const { ac, out, verb } = audio, t = ac.currentTime, p = ac.createStereoPanner ? ac.createStereoPanner() : ac.createGain();
+  if (p.pan) p.pan.value = pan;
+  p.connect(out); p.connect(verb);
+  [[1, 1, decay], [2.756, .3, decay * .35], [5.4, .1, decay * .15]].forEach(([ratio, amp, dur]) => {
+    const o = ac.createOscillator(), g = ac.createGain();
+    o.frequency.value = freq * ratio;
+    g.gain.setValueAtTime(0, t); g.gain.linearRampToValueAtTime(level * amp, t + .004); g.gain.exponentialRampToValueAtTime(1e-4, t + dur);
+    o.connect(g).connect(p); o.start(t); o.stop(t + dur);
+  });
+}
+function chirp() {
+  const { ac, verb, out } = audio, base = 2300 + 2600 * Math.random(), n = 2 + Math.floor(Math.random() * 4);
+  let t = ac.currentTime;
+  for (let i = 0; i < n; i++, t += .07 + .06 * Math.random()) {
+    const o = ac.createOscillator(), g = ac.createGain();
+    o.frequency.setValueAtTime(base * (.9 + .3 * Math.random()), t);
+    o.frequency.exponentialRampToValueAtTime(base * (.7 + .7 * Math.random()), t + .06);
+    g.gain.setValueAtTime(0, t); g.gain.linearRampToValueAtTime(.012, t + .012); g.gain.exponentialRampToValueAtTime(1e-4, t + .09);
+    o.connect(g); g.connect(verb); g.connect(out); o.start(t); o.stop(t + .1);
+  }
+}
+const CHORDS = [[0, 7, 16, 19], [-3, 9, 12, 16], [-7, 5, 9, 12], [-5, 7, 14, 16], [2, 9, 14, 17]];
+function updateAudio(dt) {
+  const a = audio; if (!a.ac) return;
+  const t = a.ac.currentTime, s = Math.abs(brush.s), to = (param, v, tau = .08) => param.setTargetAtTime(v, t, tau);
+  const day = 1 - sun.night;
+  to(a.sea.g, .075 + .035 * Math.sin(time * .43) + .02 * Math.sin(time * .171), .3);
+  to(a.sea.f, 380 + 170 * Math.sin(time * .43 + 1), .3);
+  to(a.wind.g, .01 + .03 * smooth(300, 1100, cam.dist) + .012 * Math.sin(time * .23), .4);
+  to(a.wind.f, 560 + 260 * Math.sin(time * .11), .5);
+  to(a.water.g, Math.min(.1, world.meanSpeed * 2.2 + world.speed * world.water * .08), .25);
+  to(a.rumble.g, s * .75); to(a.sub.g, s * .2);
+  to(a.sub.f, 38 + 10 * s + 3 * Math.sin(time * 9));
+
+  // Melody: the height of the land under the hand, quantised to the scale.
+  const step = Math.floor(world.h / 6.5);
+  if (s > .25 && step !== a.step && t > a.nextNote) {
+    pluck(noteAt(step + 5), .05 + .06 * s, clamp(pointer.x / innerWidth * 2 - 1, -1, 1) * .7, brush.s > 0 ? 2.6 : 1.4);
+    a.nextNote = t + .07;
+  }
+  a.step = step;
+  to(a.earth.f, noteAt(step) / 2, .12); to(a.earth.g, s * .11, .1);
+
+  if (t > a.nextChord) {
+    const chord = CHORDS[Math.floor(Math.random() * CHORDS.length)];
+    a.pad.forEach((v, i) => to(v.f, a.root * 2 ** (chord[i] / 12) * (1 + (i - 1.5) * .0015), 1.6));
+    a.nextChord = t + 12 + 10 * Math.random();
+    if (Math.random() < .6) pluck(a.root * 2 ** ((chord[2 + (Math.random() < .5)] + 12) / 12), .018, Math.random() - .5, 5);
+  }
+  to(a.padFilter.frequency, 260 + 520 * day + 300 * s, 1);
+  if (Math.random() < dt * Math.min(world.meanVeg * 14, 1.6) * day) chirp();
+}
+
+// ───────────────────────────────────────────────────────────── main loop
+let last = 0;
+function frame(now) {
+  const dt = clamp((now - last) / 1000, 0, .05); last = now;
+  time += dt; idle += dt;
+  adapt(dt);
+  updateSky(dt);
+  updateCamera(dt);
+  simulate(dt);
+  updateBrush(dt);
+  render();
+  updateAudio(dt);
+  requestAnimationFrame(frame);
+}
+canvas.addEventListener('webglcontextlost', e => { e.preventDefault(); $('veil').style.opacity = 1; $('go').textContent = 'the graphics context was lost — reload to continue'; });
+if (matchMedia('(pointer: coarse)').matches) $('go').textContent = 'touch to begin';
+newWorld(seed);
+resize();
+requestAnimationFrame(t => { last = t; frame(t); });
+</script>
+</body>
+</html>
