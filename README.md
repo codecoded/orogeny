@@ -17,7 +17,7 @@ step, no assets. Every pixel and every sample is generated at runtime (WebGL2 + 
 | Drag on the planet | Raise land |
 | Shift-drag, right-drag, or the arrow button / Space | Carve |
 | Drag on space, arrow keys / WASD | Turn the planet |
-| Wheel or pinch | Descend to low orbit, or pull back |
+| Wheel or pinch | Descend until the mountains fill the view, or pull back |
 | N | New world (the seed is in the URL hash) |
 | M | Mute |
 | Hold T | Fast-forward |
@@ -44,9 +44,14 @@ depth, suspended sediment, vegetation, ice, soil moisture and people.
 - **Light.** Single scattering through an exponential atmosphere with a closed-form optical
   depth, so sunsets, the blue limb and the ring of light round an eclipsed planet all come from
   one small loop. Sun shadows and ambient occlusion are marched in the planet's own map.
+- **Close up.** One cell of the map then covers many pixels, so the picture switches to cubic
+  filtering and draws relief the grid cannot hold as bumps: gullies on bare rock, dunes on sand,
+  wind wrinkles on water. Each octave fades out before it gets finer than a pixel.
 - **Sound.** Synthesised with Web Audio and mixed by what the camera is looking at.
 
 ![Low orbit](shots/low-orbit.jpg)
+![Down among the mountains](shots/mountains.jpg)
+![An island from close by](shots/island.jpg)
 ![Cities on the night side](shots/night-cities.jpg)
 ![Eclipse](shots/eclipse.jpg)
 

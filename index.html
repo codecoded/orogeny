@@ -167,11 +167,12 @@ const N = +query.get('n') || (!canFloat || matchMedia('(pointer: coarse)').match
 const NW = 512;                        // the weather map
 const R = .3 * N;                      // planet radius, chosen so that a cell is about one world unit across
 const ZS = N > 512 ? .5 : .35;         // how tall a unit of simulated height is drawn
-const NEAR = R + 175, FARD = 6 * R;    // the camera's range, from low orbit to far enough to hold the planet
+const HMAX = 60;                       // no land or water stands higher than this
+const NEAR = R + ZS * HMAX + 8, FARD = 6 * R;   // the camera's range: from just clear of the highest peak, out to where the planet is small
 
 // ───────────────────────────────────────────────────────────── shaders
 const HEAD = LEAN + `
-const float N = ${N}., NW = ${NW}., R = ${R.toFixed(1)}, ZS = ${ZS}, HMAX = 60., FAR = 6e4;
+const float N = ${N}., NW = ${NW}., R = ${R.toFixed(1)}, ZS = ${ZS}, HMAX = ${HMAX}., FAR = 6e4;
 const int M = ${N - 1}, MW = ${NW - 1};
 uniform float uTime, uSea, uWarm; uniform vec3 uSeed;
 
@@ -468,7 +469,7 @@ bool scene(vec3 ro, vec3 rd, out float t){
   vec2 shell = sphere(ro, rd, R+ZS*HMAX); t = max(shell.x, 0.);
   if(shell.y<t) return false;
   float sea = sphere(ro, rd, R+ZS*uSea).x, end = min(shell.y, sea>0. ? sea : FAR), tp = t;
-  for(int i=0;i<72;i++){
+  for(int i=0;i<96;i++){
     vec3 p = ro+rd*t; float r = length(p), dy = r-top(p/r);
     if(dy<0.){
       float a = tp, b = t;
@@ -476,9 +477,9 @@ bool scene(vec3 ro, vec3 rd, out float t){
       return true;
     }
     tp = t; t += max(dy*.7, .003*t);
-    if(t>end) break;
+    if(t>end){ t = sea; return sea>0. && sea<FAR; }
   }
-  t = sea; return sea>0. && sea<FAR;
+  return true;                                       // out of steps while skimming the ground: as good as a hit
 }`;
 
 // A few pixels of ground truth for the CPU: where the pointer's ray lands, the state under the
@@ -558,11 +559,33 @@ uniform vec4 uBrush; uniform float uBrushR;
 out vec4 o;
 vec3 tangent(vec3 v, vec3 up){ return v-up*dot(v, up); }   // the part of v that lies along the ground
 
+// Cubic B-spline filtering from four bilinear taps (Sigg & Hadwiger). When one cell of the map
+// covers many pixels, bilinear filtering shows its creases; this rounds them off. It needs two
+// cells of margin and the gutter is one, so toward the map's edge it hands back to bilinear.
+vec4 soft(sampler2D s, vec2 uv, float amount){
+  vec4 plain = textureLod(s, uv, 0.);
+  vec2 size = vec2(textureSize(s, 0)), x = uv*size-.5, f = fract(x), i = floor(x);
+  amount *= smoothstep(1., 2.5, min(min(x.x, x.y), min(size.x-1.-x.x, size.y-1.-x.y)));
+  if(amount<=0.) return plain;
+  vec2 w0 = (1.-f)*(1.-f)*(1.-f)/6., w1 = (3.*f*f*f-6.*f*f+4.)/6., g0 = w0+w1, g1 = 1.-g0;
+  vec2 a = (i+w1/g0-.5)/size, b = (i+f*f*f/(6.*g1)+1.5)/size;
+  return mix(plain, g0.y*(g0.x*textureLod(s, a, 0.)+g1.x*textureLod(s, vec2(b.x, a.y), 0.))
+                   +g1.y*(g0.x*textureLod(s, vec2(a.x, b.y), 0.)+g1.x*textureLod(s, b, 0.)), amount);
+}
+// Relief finer than the grid can hold is drawn as bumps: octaves of noise that lean the normal
+// and darken the hollows. On bare rock the bumps are creased, which reads as gullies.
+vec4 octave(vec3 q){ vec4 n = noised(OCT*q); return vec4(n.x, .5*n.yzw*OCT); }   // noise in a turned frame, so octaves do not line up
+vec4 relief(vec4 n, float rocky){ return mix(vec4(n.yzw, n.x-.5), vec4(sign(.5-n.x)*n.yzw, .5-abs(2.*n.x-1.)), rocky); }
+
 vec3 shade(vec3 p, vec3 rd, float t){
   float r = length(p); vec3 up = p/r; vec2 uv = gut(up, N);
-  vec4 c = textureLod(uD0, uv, 0.), g = textureLod(uD1, uv, 0.), f = textureLod(uD2, uv, 0.),
-       life = textureLod(uD3, uv, 0.), sh = textureLod(uSh, uv, 0.);
-  float b = c.x, d = c.y, veg = c.z, h = b-uSea, mu = dot(up, uSun), T = temperature(up, b);
+  float px = t*2.*length(uCu)/uRes.y, zoom = 1.-smoothstep(.1, .25, px);   // ground covered by one pixel; how magnified the map is
+  vec4 c = soft(uD0, uv, zoom), g = soft(uD1, uv, zoom), sh = soft(uSh, uv, zoom),
+       f = textureLod(uD2, uv, 0.), life = textureLod(uD3, uv, 0.);
+  // Thin sheets of rain run downhill in pulses a cell wide; averaged over 2×2 cells (the next
+  // mip) they are an even film. Rivers, lakes and sea keep their own depth.
+  float film = textureLod(uD0, uv, 1.).y, d = mix(film, c.y, smoothstep(.1, .3, film));
+  float b = c.x, veg = c.z, h = b-uSea, mu = dot(up, uSun), T = temperature(up, b);
   vec3 nrm = normalize(g.xyz);
   float flatness = dot(nrm, up), slope = sqrt(max(1.-flatness*flatness, 0.))/max(flatness, .2)/ZS, steep = smoothstep(.5, 1., slope);
   float night = 1.-smoothstep(-.15, .1, mu);
@@ -573,13 +596,16 @@ vec3 shade(vec3 p, vec3 rd, float t){
 
   // Ground. Strata are a function of height alone, so rivers cut down through visible layers.
   // Climate chooses the rest: sand or loam, savanna or rainforest or taiga, snow.
-  vec4 n1 = noised(p*.31+uSeed), n2 = noised(p*1.7);
+  vec4 n1 = noised(p*.31+uSeed), n2 = noised(p*1.7), n3 = vec4(.5, 0, 0, 0), n4 = n3;
+  float w2 = 1.-smoothstep(.2, .5, px*1.7), w3 = 1.-smoothstep(.2, .5, px*4.6), w4 = 1.-smoothstep(.2, .5, px*12.);   // an octave fades before it is finer than a pixel
+  if(w3>0.) n3 = octave(p*2.3+3.);
+  if(w4>0.) n4 = octave(p*6.+7.);
   float arid = 1.-smoothstep(.1, .5, life.y), cold = 1.-smoothstep(-.05, .3, T);
   float canopy = smoothstep(.3, .62, veg+.35*(n2.x-.5))*(1.-.85*steep);
   float band = .65*noise(vec3(b*.7+4.*n1.x, uSeed.x, 0.))+.35*noise(vec3(b*1.9+7.*n1.x, uSeed.y, 0.));
   vec3 rockc = mix(vec3(.15, .115, .095), vec3(.34, .25, .17), smoothstep(.3, .7, band));
   rockc = mix(mix(rockc, vec3(.4, .2, .11)*(.55+.9*band), .65*arid), vec3(.24, .24, .26)*(.6+.8*band), .7*cold);
-  float tone = .55+.5*noise(p*.07+uSeed)+.3*(n1.x-.5)+.25*(n2.x-.5);
+  float tone = .55+.5*noise(p*.07+uSeed)+.3*(n1.x-.5)+.25*(n2.x-.5)+.2*w3*(n3.x-.5);
   vec3 soilc = mix(vec3(.17, .125, .075), mix(vec3(.42, .26, .13), vec3(.5, .38, .22), noise(p*.021+uSeed.zxy)), arid)*tone;
   vec3 alb = mix(soilc, rockc, .15+.85*steep);
   alb = mix(alb, vec3(.56, .48, .34)*(.85+.3*n2.x), (1.-smoothstep(.5, 2.8, h))*(1.-steep));       // sand by the sea, and under it
@@ -589,8 +615,15 @@ vec3 shade(vec3 p, vec3 rd, float t){
   float snow = smoothstep(.05, .5, f.w+.3*(n1.x-.5)*step(.01, f.w));
   alb = mix(alb, vec3(.8, .85, .92), snow);
   alb *= 1.-.45*clamp(smoothstep(0., .05, d)+d*4., 0., 1.);                                        // wet ground is darker
-  // Small-scale relief the grid cannot hold: rock grain, or a bumpier canopy where it is wooded.
-  vec3 n = normalize(up+tangent(nrm, up)*.6/ZS+tangent(n1.yzw, up)*.3*(1.-.6*canopy)+tangent(n2.yzw, up)*.45*mix(.4+.4*steep, 1.6, canopy)*(1.-.8*snow)/(1.+t*.0025));   // slopes exaggerated, as on a relief map
+  // Fine relief: rock grain and gullies, a bumpy canopy where it is wooded, dunes on open sand.
+  float bare = (1.-canopy)*(1.-snow), rocky = bare*max(steep, .5*cold), sandy = bare*arid*(1.-steep)*smoothstep(.3, 1.5, h);
+  vec4 bumps = w2*.45*mix(.4+.4*steep, 1.6, canopy)*relief(n2, rocky)+w3*.4*mix(.5+.5*steep, 1.3, canopy)*relief(n3, rocky)+w4*.3*relief(n4, rocky);
+  if(sandy>.02 && w2>0.){
+    vec4 dune = noised(p*vec3(.45, 1.5, .45)+uSeed.zxy+1.6*n1.x);   // stretched, so its crests run in lines; warped, so they wander
+    bumps = mix(bumps, bumps*.4+.7*w2*vec4(sign(dune.x-.5)*dune.yzw*vec3(.3, 1., .3), abs(2.*dune.x-1.)-.5), sandy*smoothstep(.2, .6, noise(p*.05+uSeed)));
+  }
+  alb *= 1.-.7*bumps.w*(1.-.7*snow);
+  vec3 n = normalize(up+tangent(nrm, up)*.6/ZS+tangent(n1.yzw, up)*.3*(1.-.6*canopy)*(1.-.5*sandy)+tangent(bumps.xyz, up)*(1.-.8*snow));   // slopes exaggerated, as on a relief map
   vec3 col = alb*(sun*max(dot(n, uSun), 0.)+ambient+flashes(up, 3000.));
 
   float wet = smoothstep(.008, .06, d);
@@ -598,6 +631,8 @@ vec3 shade(vec3 p, vec3 rd, float t){
     // Wind ripples ride on the simulated surface, whose own slope carries the swells and wakes.
     float calm = 1./(1.+t*.004);
     vec3 rip = .13*noised(p*.13+uTime*vec3(.2, .12, .1)).yzw+.12*calm*noised(p*.4-uTime*vec3(.3, .4, .2)).yzw;
+    vec4 chop = vec4(.5, 0, 0, 0);                    // up close, wind wrinkles, drawn out along their crests
+    if(w3>0.){ chop = octave(p*vec3(1.2, .5, 1.2)+uTime*vec3(.4, -.3, .35)); rip += .09*w3*chop.yzw; }
     vec3 wn = normalize(nrm+tangent(rip, up)*.35*calm*smoothstep(0., 1.2, d));
     float fres = .02+.98*pow(1.-max(dot(-rd, wn), 0.), 5.), fn0 = noise(p*.7+uTime*vec3(.2, .1, .15));
     vec3 rr = reflect(rd, wn);
@@ -609,6 +644,7 @@ vec3 shade(vec3 p, vec3 rd, float t){
     vec3 ext = exp(-path*mix(vec3(2., .55, .36), vec3(1.8, 2.2, 2.8), silt));
     vec3 inLight = sun*max(mu, 0.)*.45+dome(mu, .6, .5)*.9;
     vec3 w = mix(col*ext+mix(vec3(.002, .035, .06), vec3(.3, .21, .11), silt)*inLight*(1.-ext), refl, fres);
+    w *= 1.+(1.2*dot(tangent(rip, up), uSun)+.22*w3*(chop.x-.5))*smoothstep(0., 1.2, d);   // faces of waves that lean toward the sun are brighter
     float glint = max(dot(rr, uSun), 0.);
     w += sun*(1.2*pow(glint, 160.)*(.5+fn0)+.08*pow(glint, 14.))*(1.-smoothstep(.2, .8, slope));
 
@@ -617,7 +653,7 @@ vec3 shade(vec3 p, vec3 rd, float t){
     float ph = fract(uTime*.4); vec3 fl = f.xyz*9.;
     float fn = mix(noise(p*1.4-fl*ph), noise(p*1.4-fl*fract(ph+.5)+5.), abs(1.-2.*ph));
     float rapids = .6*smoothstep(.6, 1.2, c.w)*(1.-smoothstep(.3, 2., d))*smoothstep(.12, .3, d);
-    float shore = step(h+d, .6), surf = (1.-smoothstep(.03, .5, d))*shore*(.55+.45*sin(uTime*1.1+6.*noise(p*.06)+d*9.));
+    float shore = step(h+d, .6), surf = (1.-smoothstep(.03, .35, d))*shore*(.5+.45*sin(uTime*1.1+6.*noise(p*.06)+d*9.));
     float foam = smoothstep(.55, .9, .5*fn+max(rapids, surf));
     w = mix(w, vec3(.8, .84, .86)*(inLight+sun*.15), foam*.9);
     w += night*vec3(.01, .16, .2)*(foam+smoothstep(.03, .3, c.w)*(.3+.7*fn))*(.2+.8*shore)*smoothstep(.45, .7, noise(p*.04+uTime*.02));   // on some nights, in some bays, disturbed water glows
@@ -641,15 +677,15 @@ vec4 clouds(vec3 ro, vec3 rd, float tEnd){
   vec2 outer = sphere(ro, rd, RC+TC), inner = sphere(ro, rd, RC);
   if(outer.x<=0. || outer.x>=tEnd) return vec4(0.);
   float tb = min(inner.x>0. && inner.x<FAR ? inner.x : outer.y, tEnd), dt = (tb-outer.x)/4., alpha = 0., lit = 0.;
-  float fine = clamp(260./outer.x-.6, 0., 1.);       // extra detail, only when close enough to resolve it
+  float fine = 1.-smoothstep(.25, .6, outer.x*2.*length(uCu)/uRes.y);   // extra detail, only when close enough to resolve it
   vec3 entry = normalize(ro+rd*outer.x), sunward = normalize(tangent(uSun, entry)+1e-4);
   for(float i=.5; i<4.; i++){
     vec3 p = ro+rd*(outer.x+i*dt); float r = length(p); vec3 dir = p/r; float h = (r-RC)/TC, cover = coverAt(dir);
     if(cover<.03) continue;
     vec4 heap = vec4(.5, 0, 0, 0);                   // up close the cover breaks into heaps: noise, with its gradient for shading
     if(fine>0.){
-      vec3 q = p*.25+uTime*.015;
-      heap = mix(heap, .57*noised(q)+vec4(.29, vec3(.67))*noised(q*2.3+5.)+vec4(.14, vec3(.74))*noised(q*5.3+9.), fine);
+      vec3 q = p*.25+uTime*.015; vec4 m = noised(OCT*q+5.), k = noised(OCT*OCT*q+9.);
+      heap = mix(heap, .57*noised(q)+.29*vec4(m.x, m.yzw*OCT)+.14*vec4(k.x, k.yzw*OCT*OCT), fine);
     }
     float a = (1.-alpha)*(1.-exp(-smoothstep(.1+.25*fine, .8-.25*fine, 1.25*cover-(1.-heap.x)-.45*h*(1.6-cover)+.05)*dt*.5/ZS));
     // One tap toward the sun for the shadow of the cloud beyond; the heap's own slope for its lit and dark sides.
@@ -706,7 +742,7 @@ void main(){
     glow += w*a.rgb; pass += w*texelFetch(uAirPass, at, 0).rgb; total += w;
   }
   vec4 cl = clouds(uRo, rd, depth);
-  o = vec4((col*pass+glow)/max(total, 1e-6)*(1.-cl.a)+cl.rgb+aurora(uRo, rd, depth), 1.);
+  o = vec4((col*pass+glow)/max(total, 1e-6)*(1.-cl.a)+cl.rgb+aurora(uRo, rd, depth), hit ? t : 0.);   // depth 0 marks space
 }`;
 
 const POST = {};
@@ -720,12 +756,21 @@ void main(){
   o = vec4(c, 1);
 }`;
 
-// The lens: bloom, exposure, filmic tone curve and grade. Luma goes to alpha for anti-aliasing.
+// The lens: close to the ground a shallow depth of field (which is what makes the land read as a
+// model you could touch), then bloom, exposure, filmic tone curve and grade. Luma goes to alpha
+// for anti-aliasing.
 POST.lens = `
-uniform sampler2D uScene, uBloom; uniform vec2 uRes; uniform float uExposure; out vec4 o;
+uniform sampler2D uScene, uBloom; uniform vec2 uRes; uniform float uExposure, uFocus, uBlur; out vec4 o;
 void main(){
-  vec2 uv = gl_FragCoord.xy/uRes;
-  vec3 col = (texture(uScene, uv).rgb+texture(uBloom, uv).rgb*.045)*uExposure;
+  vec2 uv = gl_FragCoord.xy/uRes; vec4 c = texture(uScene, uv); vec3 col = c.rgb;
+  float coc = c.a>0. ? uBlur*clamp(abs(uFocus/c.a-1.)*1.5-.15, 0., 1.)*min(uRes.x, uRes.y)/220. : 0.;
+  if(coc>.5){
+    for(int i=0;i<8;i++){   // golden-angle disc
+      float a = float(i)*2.4; col += texture(uScene, uv+vec2(cos(a), sin(a))*sqrt((float(i)+.5)/8.)*coc/uRes).rgb;
+    }
+    col /= 9.;
+  }
+  col = (col+texture(uBloom, uv).rgb*.045)*uExposure;
   col = clamp(col*(2.51*col+.03)/(col*(2.43*col+.59)+.14), 0., 1.);            // ACES fit (Narkowicz)
   float l = dot(col, vec3(.2126,.7152,.0722));
   col = mix(col, col*vec3(.94,1.,1.1), 1.-smoothstep(0., .4, l));              // cool shadows
@@ -779,7 +824,7 @@ if (!(seed > 0)) seed = 1 + Math.floor(Math.random() * 36 ** 4);
 let seedVec, started = false, idle = 0, frameCount = 0, warmup = 0, stepDebt = 0;
 const world = { time: 0, clock: 0, age: 0, dt: 0, pace: 1, far: 1, sea: 0, warm: 1,
   h: 0, water: 0, speed: 0, meanH: 0, meanSpeed: 0, meanIce: 0, land0: null, ice0: null };
-const look = { h: 0, veg: 0, rain: 0, hit: false, dir: [0, 0, 1] };     // what lies under the centre of the view
+const look = { h: 0, veg: 0, rain: 0, hit: false, dir: [0, 0, 1], range: R };   // what lies under the centre of the view, and how far off
 const brush = { dir: [0, 0, 1], target: [0, 0, 1], s: 0, radius: 20, glow: 0 };
 const cam = { az: 0, lat: .3, dist: 4.7 * R, azT: 0, latT: .3, distT: 4.7 * R, drift: 1, tanV: .29 };
 const sun = { angle: 0, dir: [0, 0, 1] };
@@ -820,7 +865,7 @@ function simulate(dt) {
   stepDebt = Math.min(stepDebt + dt * 110 * (1 + world.far) * view.sim, MAXSTEPS);
   let steps = Math.floor(stepDebt); stepDebt -= steps;
   if (warmup > 0) { steps = MAXSTEPS; warmup -= steps; }
-  const g = globals(), lift = brush.s * 12 * dt / Math.max(steps, 1);          // the hand moves land at a rate per second, not per step
+  const g = globals(), lift = brush.s * clamp(.6 * brush.radius, 11, 18) * dt / Math.max(steps, 1);   // a rate per second, not per step; gentler up close
   for (let i = 0; i < steps; i++) {
     draw(P.flux, fluxes[1], { ...g, uS: stateA, uF: fluxes[0].tex }); fluxes.reverse();
     draw(P.flow, toFlow, { ...g, uS: stateA, uF: fluxes[0].tex });
@@ -832,6 +877,7 @@ function simulate(dt) {
     lives.reverse();
   }
   draw(P.derive, toDerived, { ...g, uS: stateA, uV: velocity, uC: lives[0].tex });
+  gl.bindTexture(gl.TEXTURE_2D, D[0]); gl.generateMipmap(gl.TEXTURE_2D);
   // Shadows and weather change slowly: they take turns.
   if (frameCount & 1) draw(P.shadow, toShadow, { ...g, uD0: D[0], uSun: sun.dir });
   else {
@@ -880,7 +926,7 @@ function updateCamera(dt) {
   const tiltKey = (keys.arrowup || keys.w ? 1 : 0) - (keys.arrowdown || keys.s ? 1 : 0);
   const reach = (cam.dist - R) / R;                    // the surface should move under a finger at the finger's speed
   cam.drift += ((gesture || turnKey ? 0 : 1) - cam.drift) * ease(dt, 2.5);   // hold still while a hand is on the world
-  cam.azT += dt * (turnKey * .9 * reach + cam.drift * .012 * (1 + reach));
+  cam.azT += dt * (turnKey * .9 * reach + cam.drift * .015 * reach ** .7);   // drift slowly when close, so the ground does not slide away
   cam.latT = clamp(cam.latT + tiltKey * dt * .7 * reach, -1.35, 1.35);
   cam.distT = clamp(cam.distT, NEAR, FARD);
   const k = ease(dt, .16);
@@ -904,7 +950,7 @@ function onSphere(rd, r) {
 // ───────────────────────────────────────────────────────────── input
 // One finger or the left button sculpts where it lands on the planet, and turns the planet where
 // it lands on space. Which of the two is decided by the GPU pick on the next frame.
-const pointer = { x: innerWidth / 2, y: innerHeight / 2, hover: false, carve: false, anchor: R };
+const pointer = { x: innerWidth / 2, y: innerHeight / 2, hover: false, carve: false, anchor: R, touch: false, since: 0 };
 const touches = new Map(), keys = {}, tool = $('tool');
 let gesture = null, pinch = 0;     // null | 'pending' | 'sculpt' | 'orbit' | 'pinch'
 const carving = () => pointer.carve || keys.shift || tool.classList.contains('carve');
@@ -920,7 +966,7 @@ canvas.addEventListener('pointerdown', e => {
   if (!started) begin(e.pointerType);
   idle = 0;
   if (touches.size === 1) {
-    Object.assign(pointer, { x: e.clientX, y: e.clientY, carve: e.button === 2 });
+    Object.assign(pointer, { x: e.clientX, y: e.clientY, carve: e.button === 2, touch: e.pointerType === 'touch', since: world.time });
     gesture = 'pending';
   } else { gesture = 'pinch'; pinch = spread(); }
 });
@@ -943,6 +989,7 @@ canvas.addEventListener('pointerup', release);
 canvas.addEventListener('pointercancel', release);
 canvas.addEventListener('pointerleave', () => { pointer.hover = false; });
 canvas.addEventListener('contextmenu', e => e.preventDefault());
+addEventListener('gesturestart', e => e.preventDefault());   // iOS Safari: keep pinches for the planet, not the page
 canvas.addEventListener('wheel', e => { e.preventDefault(); idle = 0; cam.distT = R + (cam.distT - R) * Math.exp(e.deltaY * .0015); }, { passive: false });
 tool.addEventListener('click', () => tool.classList.toggle('carve'));
 addEventListener('keydown', e => {
@@ -1003,7 +1050,7 @@ function census() {
 function updateBrush(dt) {
   // Ask the GPU where the pointer's ray lands, what lies under the brush, and what we are looking at.
   const rd = pointerRay();
-  look.dir = onSphere(cam.f, R);
+  look.dir = onSphere(cam.f, R); look.range = Math.hypot(...add(cam.pos, scale(look.dir, -R)));
   draw(P.pick, toPick, { ...eye(), uW: weather[0].tex, uRd: rd, uProbe: brush.dir, uLook: cam.f });
   gl.readPixels(0, 0, 3, 1, gl.RGBA, gl.FLOAT, pickBuf);
   const hit = pickBuf[3] > 0, at = [pickBuf[0], pickBuf[1], pickBuf[2]];
@@ -1011,7 +1058,8 @@ function updateBrush(dt) {
   Object.assign(look, { h: pickBuf[8], veg: pickBuf[9], rain: pickBuf[10], hit: pickBuf[11] > 0 });
   if (frameCount % 30 === 0) census();
 
-  if (gesture === 'pending') {
+  // A finger waits a moment before it sculpts, in case a second one is on its way to make a pinch.
+  if (gesture === 'pending' && (!pointer.touch || world.time - pointer.since > .09)) {
     gesture = hit ? 'sculpt' : 'orbit';
     if (hit) { pointer.anchor = Math.hypot(...at); brush.dir = brush.target = norm(at); }
   }
@@ -1028,7 +1076,8 @@ function updateBrush(dt) {
   brush.dir = toward(brush.dir, brush.target, ease(dt, want || glow ? .07 : 1e-3));
   brush.s += (want - brush.s) * ease(dt, Math.abs(want) > Math.abs(brush.s) ? .14 : .32);
   brush.glow += (Math.max(glow, Math.abs(brush.s)) - brush.glow) * ease(dt, .2);
-  brush.radius = 9 + (cam.dist - R) * .045;      // descend for finer work
+  // The brush covers the same share of the picture at any height, so descending means finer work.
+  brush.radius = Math.max(5, .22 * look.range * cam.tanV * Math.min(1, canvas.width / canvas.height));
 }
 
 // ───────────────────────────────────────────────────────────── adaptive quality
@@ -1082,7 +1131,8 @@ function render() {
   gl.disable(gl.BLEND);
   // Expose for what the camera faces: the night side wants a wider aperture.
   const facing = .5 * dot(add(look.dir, norm(cam.pos)), sun.dir), exposure = .5 + 1.4 * (1 - smooth(-.45, .25, facing)) * (1 - .5 * world.far);
-  draw(P.lens, ldr, { uScene: scene.tex, uBloom: bloom[0].tex, uRes: res, uExposure: exposure });
+  draw(P.lens, ldr, { uScene: scene.tex, uBloom: bloom[0].tex, uRes: res, uExposure: exposure, uFocus: look.range,
+    uBlur: 1 - smooth(NEAR, R + 4 * (NEAR - R), cam.dist) });
   draw(P.present, null, { uTime: world.time, uImg: ldr.tex, uRes: [canvas.width, canvas.height], uSrc: res, uVeil: started ? 0 : 1 });
 }
 
