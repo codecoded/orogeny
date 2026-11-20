@@ -1,39 +1,58 @@
 # Orogeny
 
-Raise islands from the sea; rain, rivers and time do the rest.
+A world you can hold. Raise land from the sea of a small planet; wind, rain, rivers, ice and
+time do the rest, and after a while something starts lighting fires on the night side.
 
 An interactive procedural tech demo in one self-contained `index.html`: no libraries, no build
 step, no assets. Every pixel and every sample is generated at runtime (WebGL2 + Web Audio).
 
 **Play it:** https://codecoded.github.io/orogeny/
 
-![Sunset after six minutes](shots/sunset-after-6-min.jpg)
+![The planet from orbit](shots/planet.jpg)
 
 ## Controls
 
 | Input | Effect |
 |---|---|
-| Drag on land or sea | Raise land |
+| Drag on the planet | Raise land |
 | Shift-drag, right-drag, or the arrow button / Space | Carve |
-| Drag the sky or open sea, arrow keys / WASD | Turn and tilt the camera |
-| Wheel or pinch | Zoom (the brush gets finer as you zoom in) |
+| Drag on space, arrow keys / WASD | Turn the planet |
+| Wheel or pinch | Descend to low orbit, or pull back |
 | N | New world (the seed is in the URL hash) |
 | M | Mute |
-| Hold T | Fast-forward the sun |
+| Hold T | Fast-forward |
+
+Time is tied to distance: from far orbit the world ages quickly, and close to the ground it
+slows to an afternoon. Left alone, an unseen hand keeps sculpting.
 
 ## How it works
 
-One 512² heightfield is the whole world: bedrock height, water depth, suspended sediment and
-vegetation per cell. Three fragment passes simulate shallow water, sediment transport and
-slumping; shadows and ambient occlusion are marched in the heightfield's own texture space; a
-single raymarch renders it; and the same state, read back from the GPU, drives a synthesised
-score.
+The whole planet is one square texture folded onto a sphere with an octahedral map, so there
+are no poles to pinch and no seams: each edge of the square is glued to itself, mirrored, and
+the simulation's neighbour lookups follow that fold. Per cell it holds bedrock height, water
+depth, suspended sediment, vegetation, ice, soil moisture and people.
 
-Weather is part of the loop: low cloud forms where air is pushed up over high ground, so a
-mountain range you raise summons its own cloud cap, visible rain falls from it, and the heaviest
-cells throw lightning. Clouds are marched volumetrically at a third of the picture's resolution.
+- **Water and rock.** Shallow water in "virtual pipes", sediment transport and talus slumping,
+  three fragment passes per step. Rock hardness varies by place and by layer.
+- **Weather.** Moisture evaporates from warm sea, is carried on the winds (trades, westerlies,
+  eddies and drifting cyclones), and falls wherever air is made to rise, above all on the
+  windward side of mountains. The far side stays dry, so the ranges you raise decide where the
+  deserts are.
+- **Climate and life.** Ice gathers where it is cold and the sea falls as it does. Soil
+  moisture remembers rain and seeps outward from rivers. Vegetation follows moisture and
+  warmth. People settle green, gentle ground near water, and their lights show at night.
+- **Light.** Single scattering through an exponential atmosphere with a closed-form optical
+  depth, so sunsets, the blue limb and the ring of light round an eclipsed planet all come from
+  one small loop. Sun shadows and ambient occlusion are marched in the planet's own map.
+- **Sound.** Synthesised with Web Audio and mixed by what the camera is looking at.
 
-![Cloud streaming off a raised peak](shots/weather.jpg)
+![Low orbit](shots/low-orbit.jpg)
+![Cities on the night side](shots/night-cities.jpg)
+![Eclipse](shots/eclipse.jpg)
 
-![Close-up](shots/closeup-strata.jpg)
-![Night](shots/night-glow.jpg)
+## The earlier version
+
+Orogeny began as a single patch of sea with islands. That version is kept at
+[`islands/`](islands/) and plays at https://codecoded.github.io/orogeny/islands/.
+
+![Islands](shots/islands/weather.jpg)
