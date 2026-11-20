@@ -423,15 +423,16 @@ void main(){
   float effort = (1.+8.*slope*slope+step(.05, s.y)+6.*step(.05, ice))*(1.-.6*smoothstep(3., 25., mine.y));
   // Somewhere busier: the middle of a town draws its surroundings, and a town in a populous region draws other towns.
   vec2 here = gut(n, N); float town = smoothstep(.02, .3, textureLod(uD3, here, ${Math.log2(N) - 6}.).x);
-  float toll = FARTHEST*(1.-.5*town*(1.+smoothstep(0., .1, textureLod(uD3, here, ${Math.log2(N) - 4}.).x))), through = pop, heading = 8.;
+  float toll = FARTHEST*(1.-.5*town*(1.+smoothstep(0., .1, textureLod(uD3, here, ${Math.log2(N) - 4}.).x))), through = pop, heading = 8., best = toll;
   for(int k=0;k<8;k++){
     ivec2 q = p+RING[k]; vec4 g = texelFetch(uG, wrap(q, M), 0);
-    float via = g.x+effort*len[k>>1];
-    if(via<toll){ toll = via; heading = float(k); }
+    float via = g.x+effort*len[k>>1], bid = via-(k==int(mine.z) ? .2 : 0.);   // keep to the way already taken unless another is clearly better
+    if(bid<best){ best = bid; heading = float(k); }
+    toll = min(toll, via);
     // Does that neighbour send its travellers here? Across a fold of the map, its way to us has our way to it, not the opposite.
     if(int(g.z)==((q.x<0 || q.y<0 || q.x>M || q.y>M) ? k : k^1)) through += .995*g.y;
   }
-  oG = vec4(toll, min(through, 999.), heading, 0.);
+  oG = vec4(toll, mine.y+.25*(min(through, 999.)-mine.y), heading, 0.);   // traffic builds and fades over a few steps, or two routes would trade it back and forth for ever
 }`;
 
 // Weather. Moisture evaporates from warm sea, rides the wind, and falls wherever air is made to
@@ -631,7 +632,7 @@ void main(){
 }`;
 
 const RENDER = TRACE + SKY + `
-uniform sampler2D uD1, uD2, uD3, uSh, uW, uAir, uAirPass;
+uniform sampler2D uD1, uD2, uD3, uSh, uW, uAir, uAirPass, uG;
 uniform vec4 uBrush, uCraft[10]; uniform float uBrushR, uBase; uniform vec2 uTurn;
 out vec4 o;
 vec3 tangent(vec3 v, vec3 up){ return v-up*dot(v, up); }   // the part of v that lies along the ground
@@ -653,6 +654,36 @@ vec4 soft(sampler2D s, vec2 uv, float amount){
 // and darken the hollows. On bare rock the bumps are creased, which reads as gullies.
 vec4 octave(vec3 q){ vec4 n = noised(OCT*q); return vec4(n.x, .5*n.yzw*OCT); }   // noise in a turned frame, so octaves do not line up
 vec4 relief(vec4 n, float rocky){ return mix(vec4(n.yzw, n.x-.5), vec4(sign(.5-n.x)*n.yzw, .5-abs(2.*n.x-1.)), rocky); }
+
+// A town at one scale: g is the place in units of the street spacing, e the width of a pixel in
+// the same units. Streets run where the ground cuts three families of evenly spaced planes, so
+// the plan comes out square in some places and triangular in others. A lamp stands at each
+// crossing that the dice allow. Returns the lamps' light, and the streets themselves.
+vec2 streets(vec3 g, vec3 up, float e, float lit){
+  vec3 run = sqrt(max(1.-up*up, 0.)), use = smoothstep(.45, .7, run);        // a family that meets the ground too obliquely is left out
+  vec3 d = (.5-abs(fract(g)-.5))/max(run, .4), id = floor(g+.5);             // over the ground, how far to each family's nearest street
+  float r = max(.09, .8*e), lamp = 0.;
+  for(int i=0;i<3;i++){
+    int j = (i+1)%3; float dd = (d[i]*d[i]+d[j]*d[j])/(r*r);
+    if(dd<8.) lamp += use[i]*use[j]*exp(-dd)*step(hash(vec3(id[i], id[j], 7.*float(i))), lit);
+  }
+  vec3 line = use*(1.-smoothstep(.035, .035+e, d))*(.4+.6*vec3(hash(id.xxx), hash(id.yyy+3.), hash(id.zzz+5.)));   // some streets are grander than others
+  return vec2(lamp*.0081/(r*r), max(line.x, max(line.y, line.z))*.07/(.07+e));   // a lamp smaller than a pixel gets dimmer, not smaller
+}
+// The road itself. Every cell on a route knows which neighbour its travellers make for, so a
+// route is a chain of straight pieces from cell to cell. Returns how far off the nearest piece
+// is, how far along it we are, and how many pass.
+vec3 route(vec3 up){
+  ivec2 c0 = min(ivec2(encode(up)*N), ivec2(M)); vec3 at = up*R, best = vec3(9., 0., 0.);
+  for(int k=0;k<9;k++){
+    ivec2 c = wrap(c0+ivec2(k%3-1, k/3-1), M); vec4 g = texelFetch(uG, c, 0);
+    if(g.y<5. || g.z>7.5) continue;
+    vec3 a = decode((vec2(c)+.5)/N)*R, ab = decode((vec2(wrap(c+RING[int(g.z)], M))+.5)/N)*R-a;
+    float h = clamp(dot(at-a, ab)/dot(ab, ab), 0., 1.), off = length(at-a-ab*h);
+    if(off<best.x) best = vec3(off, h, g.y);
+  }
+  return best;
+}
 
 vec3 shade(vec3 p, vec3 rd, float t){
   float r = length(p); vec3 up = p/r; vec2 uv = gut(up, N);
@@ -697,15 +728,27 @@ vec3 shade(vec3 p, vec3 rd, float t){
   alb = mix(alb, vec3(.045, .04, .042)*(.5+n2.x), basalt);
   float snow = smoothstep(.05, .5, f.w+.3*(n1.x-.5)*step(.01, f.w))*(1.-basalt);
   alb = mix(alb, vec3(.8, .85, .92), snow);
-  // Where people farm, the ground is parcelled out: crop, stubble and fallow, in a grid that the
-  // globe cuts through at an angle. Between the towns run the roads their traffic has worn.
-  float farm = smoothstep(.05, .3, life.x)*(1.-steep)*(1.-snow)*(1.-basalt)*step(d, .05), road = sh.z*(1.-snow)*step(d, .05);
-  if(farm>0.){
-    float k = hash(floor(OCT*p*.9));
-    vec3 crop = k<.4 ? vec3(.15, .25, .07) : k<.75 ? vec3(.5, .42, .17) : vec3(.3, .21, .13);
-    alb = mix(alb, mix(vec3(.33, .31, .13), crop, 1.-smoothstep(.12, .35, px)), .75*farm);
-  }
-  alb = mix(alb, vec3(.46, .4, .32), .6*road);
+  // Where people live. From far off: a wash of farmland, a band along each road. Up close a town
+  // has a plan at two scales, avenues about a cell apart and streets between them, laid out at a
+  // different angle in each district; fields fill the blocks that houses do not; and a road is a line.
+  float pop = life.x, settled = smoothstep(.03, .3, pop), inner = smoothstep(.35, .8, pop+.3*(n1.x-.5));
+  float a1 = 1.-smoothstep(.15, .35, px*1.3), a2 = 1.-smoothstep(.15, .35, px*6.), dry = (1.-snow)*(1.-basalt)*step(d, .05);
+  vec2 av = vec2(0.), st = av; vec3 rt = vec3(9., 0., 0.), ward = floor(p/2.6), crop = vec3(.33, .31, .13);
+  if(a1>0. && sh.z>0.) rt = route(up);
+  float busy = smoothstep(5., 60., rt.z), lane = a1*clamp(.5+(.03+.05*busy-rt.x)/px, 0., 1.);
+  if(pop>.004 && a1>0.){
+    vec3 axis = normalize(ward+.5); float spin = 1.57*hash(ward);
+    vec3 q = p*cos(spin)+cross(axis, p)*sin(spin)+axis*dot(axis, p)*(1.-cos(spin))+.4*n1.yzw;
+    av = a1*streets(q*1.3, up, px*1.3, settled*(.4+n2.x));
+    if(a2>0.) st = a2*streets(q*6., up, px*6., (.15*settled+.85*inner)*(.3+n2.x));
+    float k = hash(floor(q*2.6));
+    crop = mix(crop, k<.4 ? vec3(.15, .25, .07) : k<.75 ? vec3(.5, .42, .17) : vec3(.3, .21, .13), a1);   // crop, stubble and fallow
+    alb = mix(alb, crop, .75*settled*(1.-steep)*dry);
+    alb = mix(alb, vec3(.4, .37, .34)*mix(1., .7+.6*hash(floor(q*6.)), a2), .6*inner*a1*(1.-steep)*dry);   // roofs, block by block
+    alb = mix(alb, vec3(.56, .53, .48), (.55*av.y*settled+.3*st.y*inner)*dry);
+  } else alb = mix(alb, crop, .75*settled*(1.-steep)*dry);
+  alb = mix(alb, vec3(.46, .4, .32), .6*sh.z*(1.-a1)*dry);
+  alb = mix(alb, vec3(.52, .48, .42), .8*lane*dry);
   alb *= 1.-.45*clamp(smoothstep(0., .05, d)+d*4., 0., 1.);                                        // wet ground is darker
   // Fine relief: rock grain and gullies, a bumpy canopy where it is wooded, dunes on open sand.
   float bare = (1.-canopy)*(1.-snow), rocky = bare*max(max(steep, .5*cold), basalt), sandy = bare*arid*(1.-steep)*smoothstep(.3, 1.5, h);
@@ -754,18 +797,28 @@ vec3 shade(vec3 p, vec3 rd, float t){
     float shore = step(h+d-tide(up), .6), surf = (1.-smoothstep(.03, .35, d))*shore*(.5+.45*sin(uTime*1.1+6.*noise(p*.06)+d*9.));
     float foam = smoothstep(.55, .9, .5*fn+max(max(rapids, surf), (.2+fn)*smoothstep(.02, .3, textureLod(uD3, uv, 1.).z)));   // and steam where lava meets the sea
     w = mix(w, vec3(.8, .84, .86)*(inLight+sun*.15), foam*.9);
-    w += night*vec3(.01, .16, .2)*(foam+smoothstep(.03, .3, c.w)*(.3+.7*fn))*(.2+.8*shore)*smoothstep(.45, .7, noise(p*.04+uTime*.02));   // on some nights, in some bays, disturbed water glows
+    w += night*vec3(.01, .12, .15)*(foam+.3*smoothstep(.15, .6, c.w)*fn)*(.1+.9*shore)*smoothstep(.55, .75, noise(p*.04+uTime*.02));   // on some nights, in some bays, disturbed water glows
     float floe = shore*(1.-smoothstep(-.24, -.04, T+.3*(.6*noise(p*.05)+.4*noise(p*.16)-.5)));   // pack ice on cold seas
     w = mix(w, vec3(.78, .84, .9)*(sun*max(mu, 0.)+ambient), floe);
     col = mix(col, w, wet);
   }
   // Fires, then towns: points of light wherever people have settled, on the night side. Where
   // few live the lights are scattered; where many do they run together into cities.
-  float town = smoothstep(.62, .95, .55*noise(p*.55+uSeed)+.45*noise(p*2.6)+.55*life.x-.2)*smoothstep(.02, .15, life.x);
-  col += night*(1.-wet)*mix(vec3(1., .5, .16), vec3(1., .8, .55), town)*(7.*town+.12*life.x);
-  // Roads by night are strings of lamps; sea lanes, and the waters off a busy coast, carry the scattered lights of boats.
-  float boats = max(sh.z, smoothstep(.04, .25, textureLod(uD3, uv, 3.).x))*step(.9, noise(p*2.3+.03*uTime));
-  col += night*vec3(1., .72, .42)*(5.*sh.z*(.25+smoothstep(.35, .7, noise(p*2.9+uSeed.zxy)))*(1.-wet)+5.*boats*wet);
+  if(night>0.){
+    // Fires, then towns. From far off a town is a glow; closer, the glow comes apart into
+    // avenues, then streets, then single lamps, with dark ground between them.
+    float town = smoothstep(.55, .9, .5*noise(p*.55+uSeed)+.5*noise(p*2.6)+.7*pop-.2)*smoothstep(.02, .15, pop);
+    vec3 glow = mix(vec3(1., .5, .16), vec3(1., .8, .55), town)*(6.*town+.15*settled);
+    vec3 sodium = mix(vec3(1., .55, .22), vec3(1., .8, .58), hash(ward+9.));              // a district's lamps are of an age
+    vec3 plan = sodium*(6.*av.x+.55*av.y*settled*(.3+.7*inner))+mix(vec3(1., .7, .42)*.18*inner, sodium*(5.*st.x+.12*st.y*inner), a2);
+    col += night*(1.-wet)*(mix(glow, plan, a1)+mix(vec3(dot(alb, vec3(.33))), alb, .5)*vec3(1., .65, .38)*.12*settled);
+    // A road by night: lamps at even paces, and headlights that all run the way it was worn, toward town.
+    // Sea lanes carry ships the same way, and the waters off a busy coast the scattered lights of boats.
+    float rad = max(.06, .8*px), faint = .0036/(rad*rad), pace = (fract(rt.y*2.)-.5)*.6, cars = fract(rt.y-.3*uTime+noise(p*.3))-.5;
+    float lamps = .5*exp(-(rt.x*rt.x+pace*pace)/(rad*rad))*faint, traffic = busy*exp(-(rt.x*rt.x+cars*cars)/(rad*rad))*faint;   // a lamp smaller than a pixel gets dimmer
+    float strung = sh.z*(.25+smoothstep(.35, .7, noise(p*2.9+uSeed.zxy))), fleet = streets(p*2.3, up, px*2.3, .02*smoothstep(.04, .25, textureLod(uD3, uv, 3.).x)).x;
+    col += night*vec3(1., .72, .42)*((1.-wet)*5.*mix(strung, lamps+traffic, a1)+wet*mix(5.*sh.z*step(.9, noise(p*2.3)), 3.*fleet+5.*traffic, a1));
+  }
   float ring = sqrt(2.*max(1.-dot(up, uBrush.xyz), 0.))*R/uBrushR;
   col += vec3(1., .8, .55)*uBrush.w*(.5*(1.-smoothstep(0., .05, abs(ring-1.2)))+.1*exp(-ring*ring))*(.2+.2*sun.r+.15*night);
   return col;
@@ -1330,7 +1383,7 @@ function render() {
   const shared = { ...eye(), uSun: sun.dir, uW: weather[0].tex, uFlash: flashData, uMoon: [...moon.pos, moon.light],
     uTurn: [Math.cos(moon.angle), Math.sin(moon.angle)], uBase: moon.base };
   draw(P.air, air, { ...shared, uRes: [air.w, air.h] });
-  draw(P.render, scene, { ...shared, uD1: D[1], uD2: D[2], uD3: D[3], uSh: toShadow.tex, uAir: air.tex, uAirPass: air.textures[1],
+  draw(P.render, scene, { ...shared, uD1: D[1], uD2: D[2], uD3: D[3], uSh: toShadow.tex, uG: lives[0].textures[1], uAir: air.tex, uAirPass: air.textures[1],
     uRes: res, uBrush: [...brush.dir, brush.glow * .55], uBrushR: brush.radius, uCraft: craftData });
   // Bloom: threshold, walk down a pyramid, then add each level back into the one above.
   let src = scene;

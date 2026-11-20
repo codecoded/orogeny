@@ -63,7 +63,9 @@ One rule is used four times: a cell hands something to a lower neighbour.
 - **Roads.** Each cell keeps a toll: the effort of reaching somewhere busier than itself by its
   cheapest neighbour (distance, made worse by slopes, water and ice). Everyone in a cell sets
   off that way, and the count passing through is the road. A road lowers the toll, so paths
-  gather into highways. The result looks like a river network because it is one.
+  gather into highways. Travellers keep to the way already taken unless another is clearly
+  better, which stops two routes trading traffic for ever. The result looks like a river
+  network because it is one.
 - **Weather.** Moisture evaporates from warm sea, is carried on the winds (trades, westerlies,
   eddies and drifting cyclones), and falls wherever air is made to rise, above all on the
   windward side of mountains. The far side stays dry, so the ranges you raise decide where the
@@ -78,13 +80,18 @@ One rule is used four times: a cell hands something to a lower neighbour.
   the sky dims with the land.
 - **Close up.** One cell of the map then covers many pixels, so the picture switches to cubic
   filtering and draws relief the grid cannot hold as bumps: gullies on bare rock, dunes on sand,
-  wind wrinkles on water. Each octave fades out before it gets finer than a pixel.
+  wind wrinkles on water. Each octave fades out before it gets finer than a pixel. A town's glow
+  comes apart the same way, into avenues, then streets, then single lamps: streets run where
+  the ground cuts three families of planes, so each district gets a square or triangular plan
+  at its own angle. A road becomes the exact chain of cell-to-cell steps its travellers take,
+  with lamps at even paces and headlights running toward town.
 - **Sound.** Synthesised with Web Audio and mixed by what the camera is looking at.
 
 ![An eruption at night](shots/eruption.jpg)
 ![The same by day](shots/eruption-day.jpg)
 ![Cities, roads and a lit moon](shots/night-roads.jpg)
-![A road over the pass](shots/pass.jpg)
+![A city up close: districts, avenues, lamps](shots/city.jpg)
+![Towns and the roads between them](shots/streets.jpg)
 ![Leaving](shots/voyage.jpg)
 ![The moon's shadow](shots/moon-shadow.jpg)
 ![Low orbit](shots/low-orbit.jpg)
