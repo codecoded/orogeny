@@ -43,6 +43,7 @@
   Push land up out of the sea of a small planet and it comes as fire. Wind, rain, rivers, tides,
   ice and time do the rest. After a while something lights fires on the night side; the fires
   become towns, the towns wear roads between them, and one day a spark leaves for the moon.
+  Pull back far enough and you can follow it, and look home from there.
 
   The whole planet is one square texture folded onto a sphere. Per cell: bedrock height, water
   depth, suspended sediment, vegetation, ice, soil moisture, people, lava, and the way to town.
@@ -52,7 +53,9 @@
     weather  moisture carried on the winds; cloud and rain wherever air is made to rise
     derive   filterable copies with normals; sun shadows and occlusion marched in map space
     air      single scattering through the atmosphere, at a third of the picture's size
-    render   one march against the displaced sphere, the cloud layer, aurora, a moon; then bloom and grade
+    render   one march against the displaced sphere, the cloud layer, aurora, a moon; then bloom and grade.
+             Whatever the maps cannot hold is drawn when the eye is near enough to want it: gullies,
+             dunes, the crust on lava, the plates of pack ice, streets and lamps, the moon's small craters
     sound    a few pixels read back from the GPU drive a synthesised score
   One rule is used four times over: a cell hands something to a lower neighbour. Water does it
   with momentum, rock when it overhangs, lava while it is hot, and travellers down a field of
@@ -174,7 +177,7 @@ const R = .3 * N;                      // planet radius, chosen so that a cell i
 const ZS = N > 512 ? .5 : .35;         // how tall a unit of simulated height is drawn
 const HMAX = 60;                       // no land or water stands higher than this
 const NEAR = R + ZS * HMAX + 8, FARD = 6 * R;   // the camera's range: from just clear of the highest peak, out to where the planet is small
-const MOON_R = .3, MOON_D = 6.6 * R, TIDE = .32; // the moon: its radius (in planet radii), its distance (beyond the camera's reach), its pull on the sea
+const MOON_R = .3, MOON_D = 6.6 * R, TIDE = .32, RM = MOON_R * R; // the moon: its radius (in planet radii), its distance (beyond the camera's reach), its pull on the sea
 
 // ───────────────────────────────────────────────────────────── shaders
 const HEAD = LEAN + `
@@ -636,7 +639,7 @@ void main(){
 
 const RENDER = TRACE + SKY + `
 uniform sampler2D uD1, uD2, uD3, uSh, uW, uAir, uAirPass, uG;
-uniform vec4 uBrush, uCraft[10]; uniform float uBrushR, uBase, uPart; uniform vec2 uTurn;
+uniform vec4 uBrush, uCraft[10], uPing; uniform float uBrushR, uBase, uPart; uniform vec2 uTurn; uniform vec3 uSite, uPort;
 out vec4 o;
 vec3 tangent(vec3 v, vec3 up){ return v-up*dot(v, up); }   // the part of v that lies along the ground
 
@@ -727,7 +730,7 @@ vec3 shade(vec3 p, vec3 rd, float t){
   if(w3>0.) n3 = octave(p*2.3+3.);
   if(w4>0.) n4 = octave(p*6.+7.);
   float arid = 1.-smoothstep(.1, .5, life.y), cold = 1.-smoothstep(-.05, .3, T);
-  float canopy = smoothstep(.3, .62, veg+.35*(n2.x-.5))*(1.-.85*steep);
+  float canopy = smoothstep(.3, .62, veg+.35*(n2.x-.5)+.25*w3*(n3.x-.5))*(1.-.85*steep);
   float band = .65*noise(vec3(b*.7+4.*n1.x, uSeed.x, 0.))+.35*noise(vec3(b*1.9+7.*n1.x, uSeed.y, 0.));
   vec3 rockc = mix(vec3(.15, .115, .095), vec3(.34, .25, .17), smoothstep(.3, .7, band));
   rockc = mix(mix(rockc, vec3(.4, .2, .11)*(.55+.9*band), .65*arid), vec3(.24, .24, .26)*(.6+.8*band), .7*cold);
@@ -860,6 +863,9 @@ vec3 shade(vec3 p, vec3 rd, float t){
   }
   float ring = sqrt(2.*max(1.-dot(up, uBrush.xyz), 0.))*R/uBrushR;
   col += vec3(1., .8, .55)*uBrush.w*(.5*(1.-smoothstep(0., .05, abs(ring-1.2)))+.1*exp(-ring*ring))*(.2+.2*sun.r+.15*night);
+  // Two ripples spread from wherever something has just happened for the first time.
+  float ripple = sqrt(2.*max(1.-dot(up, uPing.xyz), 0.))-.035*uPing.w, fade = max(1.-uPing.w/9., 0.);
+  col += vec3(1., .8, .55)*fade*fade*(1.-smoothstep(0., .004+2.*px/R, min(abs(ripple), abs(ripple+.05))))*(.3+.3*sun.r+.3*night);
   return col;
 }
 
@@ -913,33 +919,45 @@ vec3 aurora(vec3 ro, vec3 rd, float tEnd){
   return sum*.12;
 }
 
-// The moon. Craters of three sizes sit in the cells of a grid that its surface cuts through, over
-// dark seas of old lava. The sun gives it phases, the planet's own glow fills in its night side,
-// and in the planet's shadow the only light to reach it has passed through every sunset on the
-// planet at once. It keeps one face turned to the planet; later, that face may not stay dark.
+// The moon. Craters sit in the cells of a grid that its surface cuts through, in sizes from a
+// third of its width down to whatever a pixel can still show, over dark seas of old lava. The
+// sun gives it phases, the planet's glow fills in its night side, and in the planet's shadow the
+// only light to reach it has passed through every sunset on the planet at once. It keeps one face
+// turned to the planet; later, the edge of that face may not stay dark.
 vec3 turn(vec3 v){ return vec3(v.x*uTurn.x-v.z*uTurn.y, v.y, v.x*uTurn.y+v.z*uTurn.x); }
 vec4 crater(vec3 g){                               // xyz: which way the ground falls; w: paler rim, darker floor
-  vec3 id = floor(g), c = id+.5+.5*(vec3(hash(id+1.7), hash(id+5.3), hash(id+9.1))-.5);
-  float k = hash(id), d = length(g-c)/(.2+.28*k);
-  if(k<.4 || d>1.7) return vec4(0.);
+  vec3 id = floor(g), c = id+.5+.3*(vec3(hash(id+1.7), hash(id+5.3), hash(id+9.1))-.5);
+  float k = hash(id), d = length(g-c)/(.1+.13*k);    // small enough that none is cut off at the edge of its cell
+  if(k<.4 || d>1.5) return vec4(0.);
   float lip = exp(-14.*(d-1.)*(d-1.));
   return vec4(normalize(g-c+1e-5)*(d<1. ? 1.6*d : -1.8*lip), .3*lip-.1*(1.-smoothstep(.5, 1., d)));
 }
 vec3 moon(vec3 rd, float t){
   vec3 at = uRo+rd*t, q = turn((at-uMoon.xyz)/RM), s = turn(uSun), home = turn(-normalize(uMoon.xyz));
-  vec4 dents = crater(q*3.)+.7*crater(q*7.+3.)+.5*crater(q*17.+8.);
-  float alb = mix(.3, .12, smoothstep(.42, .6, fbm(q*1.7+uSeed*.013)))*(1.+dents.w)*(.8+.4*noise(q*30.));
+  float px = t*2.*length(uCu)/uRes.y;
+  vec4 dents = 1.3*crater(q*1.6+.4)+crater(q*3.6)+.7*crater(q*8.+3.)+.5*crater(q*19.+8.);
+  vec3 swell = vec3(0.); float tone = 0.;            // between the craters the ground rolls
+  for(float f=45.; f<2500.; f*=2.4){
+    float w = 1.-smoothstep(.1, .3, px*f/RM);
+    if(w<=0.) break;
+    vec4 roll = noised(q*f*.6+f);
+    dents += .45*w*crater(q*f+f); swell += w*roll.yzw; tone += w*(roll.x-.5);
+  }
+  // Where they land: tracks by day and lamps by night, laid out the way their towns are, and
+  // growing with every ship. From the planet, one warm point further in.
+  float room = R*R*2.2e-6*(1.+1.5*uBase)*(1.+1.5*uBase), fine = 1.-smoothstep(.15, .35, px*3.);
+  float settled = uBase*(exp(-(1.-dot(q, turn(uSite)))*RM*RM/room)+exp(-(1.-dot(q, turn(uPort)))*RM*RM/(20.*room)));
+  vec2 plan = settled>.003 && fine>0. ? fine*streets(q*RM*3.+.3*noise(q*RM*.7), q, px*3., .7*settled)*smoothstep(.01, .1, settled) : vec2(0.);
+  float alb = mix(.3, .12, smoothstep(.42, .6, fbm(q*1.7+uSeed*.013)))*(1.+dents.w)*(.8+.4*noise(q*30.))*(1.+.25*tone)*(1.-.35*plan.y);
   float along = dot(at, uSun), sunlit = along>0. ? 1. : smoothstep(.92*R, 1.2*R, length(at-uSun*along));
-  float lit = pow(max(dot(normalize(q-.55*tangent(dents.xyz, q)), s), 0.), .75), facing = max(dot(q, home), 0.);
+  vec3 n = normalize(q-.45*tangent(dents.xyz, q)-.22*tangent(swell, q)); float lit = pow(max(dot(n, s), 0.), .75)*smoothstep(-.02, .1, dot(q, s));
   vec3 col = alb*(SUNC*.5*vec3(1., .97, .92)*lit*sunlit+vec3(.8, .2, .06)*.45*lit*(1.-sunlit)
-                 +vec3(.012, .02, .035)*(.5+.5*dot(normalize(uMoon.xyz), uSun))*facing);
-  float site = exp(-(1.-dot(q, home))*700./(.25+uBase))*smoothstep(.55, .8, noise(q*150.));
-  return col+vec3(1., .75, .45)*4.*uBase*site*(1.-lit*sunlit);
+                 +vec3(.03, .05, .09)*(.5+.5*dot(normalize(uMoon.xyz), uSun))*max(dot(n, home), 0.));
+  vec3 off = (q-turn(uSite))*RM; float wide = max(.1, 1.5*px), beacon = step(.01, uBase)*exp(-dot(off, off)/(wide*wide))*.01/(wide*wide);   // the first lamp they lit
+  return col+vec3(1., .75, .45)*(1.-.85*lit*sunlit)*(mix(5.*settled, 5.*plan.x+.03*plan.y, fine)+alb*.6*settled*fine+8.*beacon);
 }
 
 vec3 space(vec3 rd){
-  float tm = sphere(uRo-uMoon.xyz, rd, RM).x;
-  if(tm>0. && tm<FAR) return moon(rd, tm);
   // One star in some cells of a grid that the sky's sphere cuts through.
   vec3 q = rd*110., id = floor(q); float k = hash(id);
   vec3 off = fract(q)-.5-.6*(vec3(hash(id+1.7), hash(id+5.3), hash(id+9.1))-.5);
@@ -951,25 +969,28 @@ vec3 space(vec3 rd){
 }
 
 // Ships and satellites are points of light: each adds a glint wherever the ray passes close by,
-// unless the planet is in the way. Warm ones are under power; cold ones only catch the sun.
+// unless something is in the way. Warm ones are under power; cold ones only catch the sun. A point
+// is a pixel or two across, until it is near enough to have a size.
 vec3 craft(vec3 rd, float depth){
   vec3 sum = vec3(0.);
   for(int i=0;i<10;i++){
     vec3 to = uCraft[i].xyz-uRo; float along = dot(to, rd), w = uCraft[i].w;
     if(w==0. || along<0. || along>depth) continue;
-    float size = along*3.*length(uCu)/uRes.y, d = (dot(to, to)-along*along)/(size*size);
+    float size = max(along*3.*length(uCu)/uRes.y, 3e-4*R), d = (dot(to, to)-along*along)/(size*size);
     sum += (w>0. ? vec3(1., .7, .4) : vec3(.8, .9, 1.))*abs(w)*(exp(-d)+.05/(1.+d));
   }
   return sum;
 }
 
 void main(){
-  vec3 rd = viewRay(); float t; bool hit = scene(uRo, rd, t);
-  vec3 col = hit ? shade(uRo+rd*t, rd, t) : space(rd);
+  vec3 rd = viewRay(); float t, tm = sphere(uRo-uMoon.xyz, rd, RM).x; bool hit = scene(uRo, rd, t);
+  bool lunar = tm>0. && tm<FAR && (!hit || tm<t);
+  if(lunar) hit = false;
+  vec3 col = lunar ? moon(rd, tm) : hit ? shade(uRo+rd*t, rd, t) : space(rd);
   // The air layer is a third of this size. For a pixel on the ground, favour those of its four
   // nearest texels whose march stopped at a similar depth, so haze behind a ridge does not smear
   // across its edge. A pixel of open space takes them all, which keeps the limb smooth.
-  ivec2 size = textureSize(uAir, 0); float depth = hit ? min(t, FAR) : FAR, total = 0.;
+  ivec2 size = textureSize(uAir, 0); float depth = lunar ? tm : hit ? min(t, FAR) : FAR, total = 0.;
   vec2 q = gl_FragCoord.xy*vec2(size)/uRes-.5, fr = fract(q); vec3 glow = vec3(0), pass = vec3(0);
   for(int k=0;k<4;k++){
     ivec2 dq = ivec2(k&1, k>>1), at = clamp(ivec2(floor(q))+dq, ivec2(0), size-1);
@@ -977,6 +998,7 @@ void main(){
     float w = (dq.x==1 ? fr.x : 1.-fr.x)*(dq.y==1 ? fr.y : 1.-fr.y)/(.12+(hit ? abs(a.a/depth-1.) : 0.));
     glow += w*a.rgb; pass += w*texelFetch(uAirPass, at, 0).rgb; total += w;
   }
+  if(lunar){ glow = vec3(0.); pass = vec3(total); }   // none of the planet's air lies in front of the moon
   vec4 cl = clouds(uRo, rd, depth);
   o = vec4((col*pass+glow)/max(total, 1e-6)*(1.-cl.a)+cl.rgb+aurora(uRo, rd, depth)+craft(rd, depth), hit ? t : 0.);   // depth 0 marks space
 }`;
@@ -1065,9 +1087,16 @@ const world = { time: 0, clock: 0, age: 0, dt: 0, pace: 1, far: 1, sea: 0, warm:
 const look = { h: 0, veg: 0, rain: 0, people: 0, fire: 0, hit: false, dir: [0, 0, 1], range: R };   // what lies under the centre of the view, and how far off
 const stamp = () => 1 + world.clock / 16;       // the date, as the lava map records it
 const brush = { dir: [0, 0, 1], target: [0, 0, 1], s: 0, radius: 20, glow: 0, vent: 0 };
-const cam = { az: 0, lat: .3, dist: 4.7 * R, azT: 0, latT: .3, distT: 4.7 * R, drift: 1, tanV: .29 };
+const cam = { az: 0, lat: .3, dist: 4.7 * R, azT: 0, latT: .3, distT: 4.7 * R, drift: 1, tanV: .29, pull: 0, away: 0, awayT: 0, yaw: 0, pitch: 0 };
+const EYE = .008 * R, LOOKOUT = 1.53, SITE = 1.44, PORT = .95;   // on the moon: the height of the eye, and how far round from the point beneath the planet it stands, they land, and their light shows from home
 const sun = { angle: 0, dir: [0, 0, 1] };
-const moon = { angle: 0, dir: [0, 0, 1], pos: [0, 0, MOON_D], light: 0, base: 0 };
+const moon = { angle: 0, dir: [0, 0, 1], pos: [0, 0, MOON_D], light: 0, base: 0, site: [1, 0, 0], port: [1, 0, 0], up: [1, 0, 0], stand: [1, 0, MOON_D] };
+const spin = (v, axis, a) => add(add(scale(v, Math.cos(a)), scale(cross(axis, v), Math.sin(a))), scale(axis, dot(axis, v) * (1 - Math.cos(a))));   // turn v about an axis
+function swing(a, b, k) {           // part of the way from one direction to another, round the great circle between them
+  let axis = cross(a, b); const sine = Math.hypot(...axis);
+  axis = sine > 1e-3 ? scale(axis, 1 / sine) : norm(cross(a, [.3, 1, .2]));
+  return spin(a, axis, k * Math.atan2(sine, dot(a, b)));
+}
 const globals = () => ({ uTime: world.time, uSea: world.sea, uWarm: world.warm, uSeed: seedVec, uTide: [...moon.dir, TIDE] });
 const eye = () => ({ ...globals(), uD0: D[0], uRo: cam.pos, uCr: cam.r, uCu: cam.u, uCf: cam.f });
 
@@ -1085,6 +1114,8 @@ function newWorld(s) {
   cam.az = cam.azT = sun.angle + 1.15;         // open on a gibbous planet, the terminator in view
   moon.angle = cam.az + Math.PI - .62; moon.base = 0;   // …and the moon beyond its night side, about to set behind it
   Object.assign(voyage, { t: -1, next: 0, count: 0, ripe: 0 });
+  for (const k in told) delete told[k];
+  ping.t = 9;
   warmup = 240;                                // extra steps on a fresh world, so its first rivers are already cut when the veil lifts
 }
 
@@ -1093,7 +1124,7 @@ function updateTime(dt) {
   world.far = smooth(NEAR, .8 * FARD, cam.dist);
   world.pace = (1 + 5 * world.far ** 2) * (keys.t ? 10 : 1);
   const t = world.dt = dt * world.pace;
-  world.time += dt; world.clock += t; world.age += t;
+  world.time += dt; world.clock += t; world.age += Math.max(t, 3 * dt);   // the afternoon may slow, but history does not wait that long
   sun.angle += t * 2 * Math.PI / 300;
   sun.dir = norm([Math.sin(sun.angle), .2, Math.cos(sun.angle)]);       // the axis leans a little toward the sun
   // The moon circles more slowly, in a plane that holds the sun and wobbles a little about it. So
@@ -1102,6 +1133,11 @@ function updateTime(dt) {
   moon.angle += t * 2 * Math.PI / 514;
   moon.dir = norm([Math.sin(moon.angle), .2 * Math.cos(moon.angle - sun.angle) + .1 * Math.sin(world.clock * 2 * Math.PI / 2900 - 1), Math.cos(moon.angle)]);
   moon.pos = scale(moon.dir, MOON_D);
+  // It keeps one face to the planet. At the edge of that face, where the planet sits just above the horizon, is where they will land.
+  const inward = scale(moon.dir, -1), sideways = norm(cross([0, 1, 0], inward));
+  const round = a => norm(add(scale(inward, Math.cos(a)), scale(sideways, Math.sin(a))));
+  moon.site = round(SITE); moon.port = round(PORT); moon.up = round(LOOKOUT);
+  moon.stand = add(moon.pos, scale(moon.up, RM + EYE));
   const along = dot(moon.pos, sun.dir), aside = Math.hypot(...add(moon.pos, scale(sun.dir, -along)));
   moon.light = .5 * (1 - dot(moon.dir, sun.dir)) * (along > 0 ? 1 : smooth(.92 * R, 1.2 * R, aside));
   // Ice ages come and go, and the sea falls and rises with them as water is locked away and released.
@@ -1184,7 +1220,7 @@ function updateWeather(dt) {
 // climbs from the capital and crosses to the moon, where a light comes on. Others follow, and
 // each leaves a satellite behind.
 const craftData = new Float32Array(40);
-const voyage = { t: -1, next: 0, count: 0, ripe: 0, dir: [0, 0, 1], trail: [] };
+const voyage = { t: -1, next: 0, count: 0, ripe: 0, from: [0, 0, 1], trail: [] };
 const sats = [0, 1, 2, 3].map(i => ({ axis: norm([Math.sin(i * 2.4), .5 + .4 * Math.cos(i * 1.7), Math.cos(i * 2.4)]), turn: .09 + .02 * i, r: (1.17 + .035 * i) * R }));
 function updateVoyage(dt) {
   const v = voyage;
@@ -1199,44 +1235,79 @@ function updateVoyage(dt) {
   if (v.t < 0) {
     if (world.city > .22) v.ripe += dt;                            // it takes an age of cities first
     if (!(started && world.capital && v.ripe > 50 && world.time > v.next)) return;
-    Object.assign(v, { t: 0, dir: world.capital, trail: [] });
-    if (audio.ac) { thunder(v.dir); [5, 7, 9].forEach((step, i) => setTimeout(() => pluck(noteAt(step), .045, 0, 5), i * 240)); }
+    Object.assign(v, { t: 0, from: world.capital, trail: [] });
+    tell('leave', 'they are leaving', v.from);
+    if (audio.ac) { thunder(v.from); [5, 7, 9].forEach((step, i) => setTimeout(() => pluck(noteAt(step), .045, 0, 5), i * 240)); }
   }
   v.t += dt / 44;
-  // Straight up at first, then leaning over toward the moon, and homing on it at the end.
-  v.dir = toward(v.dir, moon.dir, ease(dt, 9 * (1 - v.t) + .3) * smooth(.05, .25, v.t));
-  const s = v.t * v.t * (3 - 2 * v.t), from = 1.02 * R, burn = .3 + .7 * Math.max(1 - smooth(.12, .3, v.t), smooth(.85, .95, v.t));
-  v.trail.unshift(scale(v.dir, from + (MOON_D - MOON_R * R - from) * s));
+  // Straight up at first, then leaning over toward where the moon will be, to come down on the
+  // landing ground from the planet's side of the sky: seen from the moon, out of the planet's own disc.
+  const port = add(moon.pos, scale(moon.site, RM)), far = Math.hypot(...port);
+  const s = v.t * v.t * (3 - 2 * v.t), low = 1.02 * R, burn = .3 + .7 * Math.max(1 - smooth(.12, .3, v.t), smooth(.85, .95, v.t));
+  v.trail.unshift(scale(swing(v.from, scale(port, 1 / far), smooth(.05, .9, v.t)), low + (far - low) * s));
   v.trail.length = Math.min(v.trail.length, 26);
   for (let k = 0; k < 6; k++) craftData.set([...v.trail[Math.min(k * 5, v.trail.length - 1)], (k ? 5 : 30) * (1 - k / 6) * burn], 16 + k * 4);
   if (v.t >= 1) {
     Object.assign(v, { t: -1, next: world.time + 70 + 70 * Math.random(), count: v.count + 1 });
     moon.base = Math.min(1, moon.base + .2);
+    tell('moon', 'a light on the moon  ·  keep zooming out to follow');
     if (audio.ac) pluck(noteAt(12), .04, 0, 7);
   }
 }
 
 // ───────────────────────────────────────────────────────────── camera
 // The camera circles the planet. As it comes close it tips up, so the horizon and the sky above
-// it stay in the upper part of the frame.
+// it stay in the upper part of the frame. Pulled back past its far limit it leaves altogether,
+// for the one other place to stand: on the moon, looking home.
 function updateCamera(dt) {
   const turnKey = (keys.arrowleft || keys.a ? 1 : 0) - (keys.arrowright || keys.d ? 1 : 0);
   const tiltKey = (keys.arrowup || keys.w ? 1 : 0) - (keys.arrowdown || keys.s ? 1 : 0);
   const reach = (cam.dist - R) / R;                    // the surface should move under a finger at the finger's speed
   cam.drift += ((gesture || turnKey ? 0 : 1) - cam.drift) * ease(dt, 2.5);   // hold still while a hand is on the world
-  cam.azT += dt * (turnKey * .9 * reach + cam.drift * .015 * reach ** .7);   // drift slowly when close, so the ground does not slide away
-  cam.latT = clamp(cam.latT + tiltKey * dt * .7 * reach, -1.35, 1.35);
+  if (cam.awayT) turn(turnKey * dt * 180, tiltKey * dt * 120);
+  else {
+    cam.azT += dt * (turnKey * .9 * reach + cam.drift * .015 * reach ** .7);   // drift slowly when close, so the ground does not slide away
+    cam.latT = clamp(cam.latT + tiltKey * dt * .7 * reach, -1.35, 1.35);
+  }
   cam.distT = clamp(cam.distT, NEAR, FARD);
+  cam.pull *= 1 - ease(dt, 1.5);                       // a pull against the far limit is forgotten unless it is kept up
   const k = ease(dt, .16);
-  cam.az += (cam.azT - cam.az) * k; cam.lat += (cam.latT - cam.lat) * k; cam.dist += (cam.distT - cam.dist) * k;
+  cam.az += (cam.azT - cam.az) * k; cam.lat += (cam.latT - cam.lat) * k;
+  cam.dist += (cam.distT * (1 + .25 * (cam.awayT ? 0 : cam.pull)) - cam.dist) * k;   // the limit gives a little before it gives way
+  cam.away += (cam.awayT - cam.away) * ease(dt, 1.3);
   const cl = Math.cos(cam.lat), out = [cl * Math.sin(cam.az), Math.sin(cam.lat), cl * Math.cos(cam.az)];
   const east = norm(cross([0, 1, 0], out)), north = cross(out, east), aspect = canvas.width / canvas.height;
   cam.tanV = .29 * Math.max(1, 1.2 / aspect);          // a long lens; wider on portrait screens
   const half = Math.atan(cam.tanV), limb = Math.asin(R / cam.dist);
-  const up = smooth(.75 * half, 1.5 * half, limb) * (limb - .45 * half);
-  cam.pos = scale(out, cam.dist);
-  cam.f = norm(add(scale(out, -Math.cos(up)), scale(north, Math.sin(up))));
-  cam.r = scale(east, cam.tanV * aspect); cam.u = scale(cross(east, cam.f), cam.tanV);
+  const tip = smooth(.75 * half, 1.5 * half, limb) * (limb - .45 * half);
+  let pos = scale(out, cam.dist), f = norm(add(scale(out, -Math.cos(tip)), scale(north, Math.sin(tip)))), upward = cross(east, f);
+  const a = smooth(0, 1, cam.away);
+  if (a > 0) {
+    // On the moon the lens is wider, the horizon lies a third of the way down the picture, and a
+    // drag turns the head. The way there swings round the planet at arm's length, facing it, and
+    // skims the moon's surface if that is in the way.
+    const far = Math.hypot(...moon.stand), there = scale(moon.stand, 1 / far), here = scale(pos, 1 / cam.dist);
+    const wide = Math.max(cam.tanV, .45), home = scale(there, -1), level = norm(add(home, scale(moon.up, -dot(home, moon.up))));   // toward the planet; and the same along the ground
+    const gaze = spin(spin(level, cross(moon.up, level), Math.acos(RM / (RM + EYE)) - Math.atan(.33 * wide) - cam.pitch), moon.up, cam.yaw);
+    const path = scale(swing(here, there, a), cam.dist + (far - cam.dist) * a);
+    const off = add(path, scale(moon.pos, -1)), clear = (RM + EYE) / Math.hypot(...off);
+    f = norm(add(scale(norm(path), -1), add(scale(add(f, here), 1 - a), scale(add(gaze, there), a))));
+    pos = clear > 1 ? add(moon.pos, scale(off, clear)) : path;
+    upward = norm(add(scale(upward, 1 - a), scale(moon.up, a)));
+    cam.tanV += (wide - cam.tanV) * a;
+  }
+  const right = norm(cross(f, upward));
+  cam.pos = pos; cam.f = f;
+  cam.r = scale(right, cam.tanV * aspect); cam.u = scale(cross(right, f), cam.tanV);
+}
+// Wheel and pinch. At the far limit, or on the moon, they add up to a pull instead of a distance.
+function zoom(k) {
+  if (!cam.awayT && (cam.distT < FARD || k < 1)) { cam.distT = Math.min(FARD, R + (cam.distT - R) * k); cam.pull = 0; return; }
+  cam.pull = clamp(cam.pull + Math.log(k), cam.awayT ? -1 : 0, cam.awayT ? 0 : 1);
+  if (Math.abs(cam.pull) < .3) return;
+  cam.awayT = 1 - cam.awayT; cam.pull = cam.yaw = cam.pitch = 0;
+  tool.style.opacity = cam.awayT ? 0 : .8;
+  if (cam.awayT) say('drag to look round  ·  zoom in to return', 9);
 }
 const pointerRay = () => norm(add(cam.f, add(scale(cam.r, pointer.x / innerWidth * 2 - 1), scale(cam.u, 1 - pointer.y / innerHeight * 2))));
 // Where a ray from the camera meets a sphere of radius r about the planet's centre; off the limb, the nearest point to it.
@@ -1255,7 +1326,8 @@ const carving = () => pointer.carve || keys.shift || tool.classList.contains('ca
 const spread = () => { const [a, b] = [...touches.values()]; return Math.hypot(a.x - b.x, a.y - b.y); };
 function turn(dx, dy) {
   const k = (cam.dist - R) / R * 2 * cam.tanV / innerHeight;
-  cam.azT -= dx * k / Math.max(.3, Math.cos(cam.lat)); cam.latT += dy * k;
+  if (cam.awayT) { cam.yaw = clamp(cam.yaw + dx * .004, -2.7, 2.7); cam.pitch = clamp(cam.pitch + dy * .004, -.3, 1); }
+  else { cam.azT -= dx * k / Math.max(.3, Math.cos(cam.lat)); cam.latT += dy * k; }
 }
 
 canvas.addEventListener('pointerdown', e => {
@@ -1275,7 +1347,7 @@ canvas.addEventListener('pointermove', e => {
   const dx = e.clientX - p.x, dy = e.clientY - p.y;
   p.x = e.clientX; p.y = e.clientY;
   if (gesture === 'pinch' && touches.size > 1) {
-    const s = spread(); cam.distT = R + (cam.distT - R) * pinch / s; pinch = s;
+    const s = spread(); zoom(pinch / s); pinch = s;
     turn(dx * .5, dy * .5);
   } else {
     pointer.x = e.clientX; pointer.y = e.clientY;
@@ -1288,7 +1360,7 @@ canvas.addEventListener('pointercancel', release);
 canvas.addEventListener('pointerleave', () => { pointer.hover = false; });
 canvas.addEventListener('contextmenu', e => e.preventDefault());
 addEventListener('gesturestart', e => e.preventDefault());   // iOS Safari: keep pinches for the planet, not the page
-canvas.addEventListener('wheel', e => { e.preventDefault(); idle = 0; cam.distT = R + (cam.distT - R) * Math.exp(e.deltaY * .0015); }, { passive: false });
+canvas.addEventListener('wheel', e => { e.preventDefault(); idle = 0; zoom(Math.exp(e.deltaY * .0015)); }, { passive: false });
 tool.addEventListener('click', () => tool.classList.toggle('carve'));
 addEventListener('keydown', e => {
   const k = e.key.toLowerCase(); keys[k] = true; idle = 0;
@@ -1303,12 +1375,24 @@ addEventListener('blur', () => { for (const k in keys) keys[k] = false; });
 function begin(kind) {
   started = true;
   startAudio();
-  $('veil').style.opacity = 0;
+  $('veil').style.opacity = 0; tool.style.opacity = .8;
+  say(kind === 'touch' ? 'drag the sea to raise land  ·  drag space to turn  ·  pinch to descend'
+                       : 'drag the sea to raise land  ·  shift-drag to carve  ·  scroll to descend', 12);
+}
+// The one line of words. After the opening hint it only ever marks a first: the first fire, the
+// first city, the first to leave. Each is said once, with a ripple on the ground where it happened.
+const ping = { dir: [0, 0, 1], t: 9 }, told = {};
+function say(text, seconds) {
   const hint = $('hint');
-  hint.textContent = kind === 'touch' ? 'drag the sea to raise land  ·  drag space to turn  ·  pinch to descend'
-                                      : 'drag the sea to raise land  ·  shift-drag to carve  ·  scroll to descend';
-  hint.style.opacity = .85; tool.style.opacity = .8;
-  setTimeout(() => { hint.style.opacity = 0; }, 12000);
+  hint.textContent = text; hint.style.opacity = .85;
+  clearTimeout(say.timer); say.timer = setTimeout(() => { hint.style.opacity = 0; }, seconds * 1000);
+}
+function tell(what, text, at) {
+  if (told[what] || !started) return;
+  told[what] = world.time;
+  say(text, 8);
+  if (at) Object.assign(ping, { dir: at, t: 0 });
+  if (audio.ac && at) pluck(noteAt(7), .03, 0, 6);
 }
 
 // When nobody is here, an unseen hand keeps working, so the piece is never a still.
@@ -1337,10 +1421,12 @@ function census() {
   world.meanIce = mean(1)[3];
   m = mean(2); world.people = m[0]; world.fire = m[2];
   gl.bindFramebuffer(gl.FRAMEBUFFER, towns); gl.readPixels(0, 0, 32, 32, gl.RGBA, gl.FLOAT, gazetteer);
-  let most = .08, where = -1;                    // the capital is wherever the most people live
+  let most = 0, where = 0;                       // the capital is wherever the most people live
   for (let i = 0; i < 1024; i++) if (gazetteer[i * 4] > most) { most = gazetteer[i * 4]; where = i; }
-  world.city = most;
-  world.capital = where < 0 ? null : decode(((where % 32 + .5) / 32 * G - 1) / N, ((where >> 5) + .5) / 32 * G / N - 1 / N);
+  const place = decode(((where % 32 + .5) / 32 * G - 1) / N, ((where >> 5) + .5) / 32 * G / N - 1 / N);
+  world.city = most; world.capital = most > .08 ? place : null;
+  if (most * (G / 32) ** 2 > .2) tell('fire', 'a first fire', place);
+  if (most > .3 && world.time - told.fire > 20) tell('city', 'a city', place);   // a fire is not a city overnight
   if (world.ice0 === null && warmup <= 0) { world.ice0 = world.meanIce; world.land0 = world.meanH; }
   gl.bindTexture(gl.TEXTURE_2D, weather[0].tex); gl.generateMipmap(gl.TEXTURE_2D);
   gl.bindFramebuffer(gl.FRAMEBUFFER, weather[0].forecast); gl.readPixels(0, 0, 16, 16, gl.RGBA, gl.FLOAT, forecast);
@@ -1361,8 +1447,8 @@ function updateBrush(dt) {
 
   // A finger waits a moment before it sculpts, in case a second one is on its way to make a pinch.
   if (gesture === 'pending' && (!pointer.touch || world.time - pointer.since > .09)) {
-    gesture = hit ? 'sculpt' : 'orbit';
-    if (hit) { pointer.anchor = Math.hypot(...at); brush.dir = brush.target = norm(at); }
+    gesture = hit && cam.away < .02 ? 'sculpt' : 'orbit';         // the hand does not reach from the moon
+    if (gesture === 'sculpt') { pointer.anchor = Math.hypot(...at); brush.dir = brush.target = norm(at); }
   }
   let want = 0, glow = 0;
   if (gesture === 'sculpt') {
@@ -1371,7 +1457,7 @@ function updateBrush(dt) {
     brush.target = onSphere(rd, pointer.anchor);
     want = carving() ? -1 : 1; glow = 1;
   } else if (idle > 18 || !started) want = haunt(dt);
-  else if (pointer.hover && !gesture && hit) { brush.target = norm(at); glow = .35; }
+  else if (pointer.hover && !gesture && hit && cam.away < .02) { brush.target = norm(at); glow = .35; }
 
   // The hand has mass: it eases in, and the land keeps moving for a moment after letting go.
   brush.dir = toward(brush.dir, brush.target, ease(dt, want || glow ? .07 : 1e-3));
@@ -1423,7 +1509,8 @@ function render() {
     uTurn: [Math.cos(moon.angle), Math.sin(moon.angle)], uBase: moon.base };
   draw(P.air, air, { ...shared, uRes: [air.w, air.h] });
   draw(P.render, scene, { ...shared, uD1: D[1], uD2: D[2], uD3: D[3], uSh: toShadow.tex, uG: lives[0].textures[1], uAir: air.tex, uAirPass: air.textures[1],
-    uRes: res, uBrush: [...brush.dir, brush.glow * .55], uBrushR: brush.radius, uPart: Math.min(1, 1.5 * Math.abs(brush.s)), uCraft: craftData });
+    uRes: res, uBrush: [...brush.dir, brush.glow * .55], uBrushR: brush.radius, uPart: Math.min(1, 1.5 * Math.abs(brush.s)), uCraft: craftData,
+    uSite: moon.site, uPort: moon.port, uPing: [...ping.dir, ping.t] });
   // Bloom: threshold, walk down a pyramid, then add each level back into the one above.
   let src = scene;
   bloom.forEach((b, i) => { draw(P.blur, b, { uT: src.tex, uRes: [b.w, b.h], uSpread: .5, uKnee: i ? 0 : 1.1 }); src = b; });
@@ -1432,7 +1519,10 @@ function render() {
     draw(P.blur, bloom[i - 1], { uT: bloom[i].tex, uRes: [bloom[i - 1].w, bloom[i - 1].h], uSpread: 1, uKnee: 0 });
   gl.disable(gl.BLEND);
   // Expose for what the camera faces: the night side wants a wider aperture.
-  const facing = .5 * dot(add(look.dir, norm(cam.pos)), sun.dir), exposure = .5 + 1.4 * (1 - smooth(-.45, .25, facing)) * (1 - .5 * world.far);
+  // From the moon it is the planet's phase that counts, unless the ground underfoot is in the sun.
+  const facing = .5 * dot(add(look.dir, norm(cam.pos)), sun.dir), noon = smooth(-.1, .2, dot(moon.up, sun.dir));
+  const here = .5 + 1.4 * (1 - smooth(-.45, .25, facing)) * (1 - .5 * world.far), there = .5 + .8 * (1 - smooth(-.6, .2, dot(moon.dir, sun.dir))) * (1 - noon);
+  const exposure = here + (there - here) * cam.away;
   draw(P.lens, ldr, { uScene: scene.tex, uBloom: bloom[0].tex, uRes: res, uExposure: exposure, uFocus: look.range,
     uBlur: 1 - smooth(NEAR, R + 4 * (NEAR - R), cam.dist) });
   draw(P.present, null, { uTime: world.time, uImg: ldr.tex, uRes: [canvas.width, canvas.height], uSrc: res, uVeil: started ? 0 : 1 });
@@ -1565,10 +1655,10 @@ function updateAudio(dt) {
 let last = 0;
 function frame(now) {
   const dt = clamp((now - last) / 1000, 0, .05); last = now;
-  idle += dt; frameCount++;
+  idle += dt; frameCount++; ping.t += dt;
   adapt(dt);
-  updateCamera(dt);
   updateTime(dt);
+  updateCamera(dt);                              // after the moon has moved: the camera may be standing on it
   updateWeather(dt);
   updateVoyage(dt);
   simulate(dt);

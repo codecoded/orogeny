@@ -20,6 +20,7 @@ step, no assets. Every pixel and every sample is generated at runtime (WebGL2 + 
 | Shift-drag, right-drag, or the arrow button / Space | Carve |
 | Drag on space, arrow keys / WASD | Turn the planet |
 | Wheel or pinch | Descend until the mountains fill the view, or pull back |
+| Keep pulling back past the far limit | Go to the moon and look home; drag to look round, zoom in to return |
 | N | New world (the seed is in the URL hash) |
 | M | Mute |
 | Hold T | Fast-forward |
@@ -29,7 +30,8 @@ slows to an afternoon. Left alone, an unseen hand keeps sculpting.
 
 ## What happens
 
-Nothing here is scripted except the last step. Roughly, from far orbit:
+Nothing here is scripted except the last step. The one line of text marks each first (a first
+fire, a city, a departure, a landing) with a ripple on the ground where it happened. Roughly:
 
 - **At once:** land rises under your hand with lava along its crests. The lava runs downhill,
   crusts over, hisses where it meets the sea, and leaves black rock that weathers over an age.
@@ -41,7 +43,11 @@ Nothing here is scripted except the last step. Roughly, from far orbit:
 - **After two:** roads between the towns, lamps along them at night, boats off the busy coasts.
   Carve a pass through a range, or close a strait, and the roads find it.
 - **After three or so:** a ship climbs from the largest city and crosses to the moon. A light
-  comes on there. Others follow, and satellites stay behind.
+  comes on there. Others follow, satellites stay behind, and the outpost grows.
+- **Whenever you like:** keep pulling back past the far limit and the camera leaves for the moon
+  itself. From its surface the planet you made hangs over a cratered horizon, turning through
+  its days and nights, its cities lit, with the outpost at your feet once there is one. A ship
+  arriving comes down out of the planet's own disc.
 
 Ice ages still come and go, and they can undo most of it.
 
@@ -80,15 +86,23 @@ One rule is used four times: a cell hands something to a lower neighbour.
   the sky dims with the land.
 - **Close up.** One cell of the map then covers many pixels, so the picture switches to cubic
   filtering and draws relief the grid cannot hold as bumps: gullies on bare rock, dunes on sand,
-  wind wrinkles on water. Each octave fades out before it gets finer than a pixel. A town's glow
+  wind wrinkles on water, drifts on snow. Each octave fades out before it gets finer than a
+  pixel. Lava grows a crust of dark plates with the glow in the cracks, carried downhill; the
+  same pattern a dozen times larger is the veined shield a new continent shows from orbit. Pack
+  ice breaks into plates the same way. A town's glow
   comes apart the same way, into avenues, then streets, then single lamps: streets run where
   the ground cuts three families of planes, so each district gets a square or triangular plan
   at its own angle. A road becomes the exact chain of cell-to-cell steps its travellers take,
   with lamps at even paces and headlights running toward town.
+- **The moon.** A sphere with craters in the cells of a grid, in sizes from a third of its
+  width down to whatever a pixel can show, so it holds up from orbit and from its own ground.
+  The outpost reuses the towns' street plan.
 - **Sound.** Synthesised with Web Audio and mixed by what the camera is looking at.
 
-![An eruption at night](shots/eruption.jpg)
-![The same by day](shots/eruption-day.jpg)
+![The planet from the moon](shots/from-the-moon.jpg)
+![The outpost by night](shots/outpost.jpg)
+![A new volcanic island](shots/eruption-day.jpg)
+![Lava by night](shots/eruption.jpg)
 ![Cities, roads and a lit moon](shots/night-roads.jpg)
 ![A city up close: districts, avenues, lamps](shots/city.jpg)
 ![Towns and the roads between them](shots/streets.jpg)
