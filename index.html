@@ -237,6 +237,7 @@ void main(){
 const TRACE = `
 uniform sampler2D uD0; uniform vec3 uRo, uCr, uCu, uCf, uFlash; uniform vec2 uRes;
 const float CEIL = 116., FLOOR = -7.;
+const float FAR = 6e4;                // "no hit" depth: the largest that still fits a half float (1e5 becomes infinity)
 const float BASE = 50., TOP = 92.;   // the layer of low cloud that weather happens in
 vec3 viewRay(){ vec2 s = (gl_FragCoord.xy*2.-uRes)/uRes; return normalize(uCf+uCr*s.x+uCu*s.y); }
 vec3 flash(vec2 xz){ vec2 d = xz-uFlash.xy; return vec3(.6,.7,1.)*uFlash.z*exp(-dot(d,d)/9000.); }   // lightning
@@ -394,13 +395,13 @@ vec4 clouds(float t){
     float w = (d.x==1 ? f.x : 1.-f.x)*(d.y==1 ? f.y : 1.-f.y)/(.12+abs(texelFetch(uCloudDepth, c, 0).r/t-1.));
     sum += w*texelFetch(uClouds, c, 0); total += w;
   }
-  return sum/total;
+  return sum/max(total, 1e-6);
 }
 
 void main(){
   vec3 rd = viewRay();
   float t; bool hit = scene(uRo, rd, t);
-  vec4 haze = clouds(hit ? t : 1e5);
+  vec4 haze = clouds(hit ? min(t, FAR) : FAR);
   if(hit){ o = vec4(shade(uRo, rd, t)*haze.a+haze.rgb, t); return; }
   vec3 c = sky(uRo, rd);
   if(uStars>0.){                                   // one star in some cells of a grid laid over the dome
@@ -430,7 +431,8 @@ float cloudAt(vec3 p){
 }
 void main(){
   vec3 ro = uRo, rd = viewRay();
-  float tEnd; if(!scene(ro, rd, tEnd)) tEnd = 1e5;
+  float tEnd; if(!scene(ro, rd, tEnd)) tEnd = FAR;
+  tEnd = min(tEnd, FAR);
   vec3 a = (vec3(-.5*N, 0, -.5*N)-ro)/rd, b = (vec3(.5*N, TOP, .5*N)-ro)/rd, mn = min(a,b), mx = max(a,b);
   float t = max(max(mn.x, mn.y), max(mn.z, 0.)), t1 = min(min(mx.x, mx.y), min(mx.z, tEnd));
   o = vec4(0, 0, 0, 1); oDepth = vec4(tEnd);
