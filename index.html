@@ -796,7 +796,7 @@ function updateBrush(dt) {
 function updateStorm(dt) {
   storm.flash *= Math.exp(-dt * 8);
   if (storm.again && time > storm.again) { storm.flash = .8; storm.again = 0; }
-  if (storm.cell < 0 || Math.random() > dt * .14) return;
+  if (storm.cell < 0 || Math.random() > dt * .06) return;
   storm.x = ((storm.cell % 16 + Math.random()) / 16 - .5) * N;
   storm.z = (((storm.cell >> 4) + Math.random()) / 16 - .5) * N;
   storm.flash = 1; storm.again = time + .08 + .1 * Math.random();
@@ -922,14 +922,14 @@ function pluck(freq, level, pan, decay) {      // a bell: a sine and one inharmo
     o.connect(g).connect(p); o.start(t); o.stop(t + dur);
   });
 }
-function thunder(distance) {      // a crack that darkens into a rumble, late by the distance it travelled
+function thunder(distance) {      // a distant roll, not a crack: soft onset, dark from the start, late by the distance it travelled
   const { ac, out, verb, hiss } = audio; if (!ac) return;
   const t = ac.currentTime + distance / 700, src = ac.createBufferSource(), f = ac.createBiquadFilter(), g = ac.createGain();
   src.buffer = hiss; src.playbackRate.value = .45;
-  f.frequency.setValueAtTime(1100, t); f.frequency.exponentialRampToValueAtTime(60, t + 2.8);
-  g.gain.setValueAtTime(0, t); g.gain.linearRampToValueAtTime(.55, t + .03); g.gain.exponentialRampToValueAtTime(1e-3, t + 3.4);
+  f.frequency.setValueAtTime(320, t); f.frequency.exponentialRampToValueAtTime(55, t + 3);
+  g.gain.setValueAtTime(0, t); g.gain.linearRampToValueAtTime(.13, t + .35); g.gain.exponentialRampToValueAtTime(1e-3, t + 4);
   src.connect(f).connect(g); g.connect(out); g.connect(verb);
-  src.start(t, Math.random()); src.stop(t + 3.5);
+  src.start(t, Math.random()); src.stop(t + 4.1);
 }
 function chirp() {
   const { ac, verb, out } = audio, base = 2300 + 2600 * Math.random(), n = 2 + Math.floor(Math.random() * 4);
