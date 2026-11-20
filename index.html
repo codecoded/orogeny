@@ -18,14 +18,20 @@
   #veil p { margin: 0; padding: 0 2em; text-align: center; opacity: .8;
     animation: breathe 3.4s ease-in-out infinite; }
   @keyframes breathe { 50% { opacity: .35; } }
-  #hint { position: fixed; left: 0; right: 0; bottom: 7vh; padding: 0 2em; text-align: center;
+  #hint { position: fixed; left: 0; right: 0; bottom: max(7vh, 80px); padding: 0 2em; text-align: center;
     opacity: 0; transition: opacity 2s ease; pointer-events: none; }
-  #tool { position: fixed; right: 22px; bottom: 22px; width: 46px; height: 46px; border-radius: 50%;
+  .knob { position: fixed; left: 22px; bottom: 25px; width: 40px; height: 40px; border-radius: 50%;
     border: 1px solid rgba(246,238,226,.4); display: flex; align-items: center; justify-content: center;
-    opacity: 0; transition: opacity 2s ease, background .3s; cursor: pointer;
+    color: rgba(246,238,226,.85); opacity: 0; transition: opacity 2s ease, background .3s; cursor: pointer; pointer-events: none;
     backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); }
-  #tool i { border: 7px solid transparent; border-top-width: 0; border-bottom: 11px solid rgba(246,238,226,.85);
+  .knob:active { background: rgba(246,238,226,.14); }
+  #tool { left: auto; right: 22px; bottom: 22px; width: 46px; height: 46px; }
+  #tool i { border: 7px solid transparent; border-top-width: 0; border-bottom: 11px solid;
     transition: transform .45s cubic-bezier(.3,1.6,.5,1); }
+  #snap i { width: 12px; height: 12px; border: 1.5px solid; border-radius: 50%; }                  /* a shutter */
+  #maps { left: 74px; }
+  #maps i { width: 13px; height: 13px; border: 1px solid; position: relative; }                    /* the map's own creases */
+  #maps i::after { content: ''; position: absolute; inset: 1.4px; border: 1px solid; transform: rotate(45deg); }
   #tool.carve { background: rgba(246,238,226,.14); }
   #tool.carve i { transform: rotate(180deg); }
 </style>
@@ -34,7 +40,9 @@
 <canvas id="c"></canvas>
 <div id="veil" class="type"><h1>Orogeny</h1><p id="go">click to begin</p></div>
 <div id="hint" class="type"></div>
-<div id="tool"><i></i></div>
+<div id="tool" class="knob"><i></i></div>
+<div id="snap" class="knob"><i></i></div>
+<div id="maps" class="knob"><i></i></div>
 <script>
 'use strict';
 /*
@@ -43,7 +51,8 @@
   Push land up out of the sea of a small planet and it comes as fire. Wind, rain, rivers, tides,
   ice and time do the rest. After a while something lights fires on the night side; the fires
   become towns, the towns wear roads between them, and one day a spark leaves for the moon.
-  Pull back far enough and you can follow it, and look home from there.
+  Pull back far enough and you can follow it, and look home from there. Or unfold the planet
+  into the square map all of this is computed in, and work on that.
 
   The whole planet is one square texture folded onto a sphere. Per cell: bedrock height, water
   depth, suspended sediment, vegetation, ice, soil moisture, people, lava, and the way to town.
@@ -105,9 +114,9 @@ function compile(type, src) {
 }
 const vertexShader = compile(gl.VERTEX_SHADER, VERTEX);
 const SETTER = { [gl.FLOAT]: 'uniform1fv', [gl.FLOAT_VEC2]: 'uniform2fv', [gl.FLOAT_VEC3]: 'uniform3fv', [gl.FLOAT_VEC4]: 'uniform4fv' };
-function program(source) {
+function program(source, vertex = vertexShader) {
   const id = gl.createProgram(), u = {};
-  gl.attachShader(id, vertexShader); gl.attachShader(id, compile(gl.FRAGMENT_SHADER, source));
+  gl.attachShader(id, vertex); gl.attachShader(id, compile(gl.FRAGMENT_SHADER, source));
   gl.linkProgram(id);
   if (!gl.getProgramParameter(id, gl.LINK_STATUS)) { console.error(gl.getProgramInfoLog(id)); fail('A shader failed to link on this GPU.'); }
   for (let i = gl.getProgramParameter(id, gl.ACTIVE_UNIFORMS); i--;) {
@@ -140,7 +149,7 @@ function peek(tex, level) {         // a framebuffer for reading one small mip o
   return fbo;
 }
 // Run a fragment program over a target. Uniform kinds are inferred from the values passed.
-function draw(prog, to, uniforms) {
+function draw(prog, to, uniforms, vertices = 3) {
   gl.bindFramebuffer(gl.FRAMEBUFFER, to ? to.fbo : null);
   gl.viewport(0, 0, to ? to.w : canvas.width, to ? to.h : canvas.height);
   gl.useProgram(prog.id);
@@ -152,7 +161,7 @@ function draw(prog, to, uniforms) {
     else if (typeof v === 'number') gl.uniform1f(u.at, v);
     else gl[u.set](u.at, v);
   }
-  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  gl.drawArrays(gl.TRIANGLES, 0, vertices);
 }
 
 // ───────────────────────────────────────────────────────────── how big a world?
@@ -171,12 +180,14 @@ function probe() {
   return ms;
 }
 const query = new URLSearchParams(location.search);
-const N = +query.get('n') || (!canFloat || matchMedia('(pointer: coarse)').matches || probe() > 5 ? 512 : 1024);
+const coarse = matchMedia('(pointer: coarse)').matches;   // a finger, not a mouse
+const N = +query.get('n') || (!canFloat || coarse || probe() > 5 ? 512 : 1024);
 const NW = 512;                        // the weather map
 const R = .3 * N;                      // planet radius, chosen so that a cell is about one world unit across
 const ZS = N > 512 ? .5 : .35;         // how tall a unit of simulated height is drawn
 const HMAX = 60;                       // no land or water stands higher than this
 const NEAR = R + ZS * HMAX + 8, FARD = 6 * R;   // the camera's range: from just clear of the highest peak, out to where the planet is small
+const FLAT = Math.SQRT2;                 // half the width of the unfolded map, in planet radii: its equator then just encloses the globe's outline
 const MOON_R = .3, MOON_D = 6.6 * R, TIDE = .32, RM = MOON_R * R; // the moon: its radius (in planet radii), its distance (beyond the camera's reach), its pull on the sea
 
 // ───────────────────────────────────────────────────────────── shaders
@@ -637,7 +648,9 @@ void main(){
   oGlow = vec4(glow, tEnd); oPass = vec4(pass, 1.);
 }`;
 
-const RENDER = TRACE + SKY + `
+// Everything that gives a point of the world its colour. The picture uses it along rays from the
+// eye; the unfolded map uses it again, looking straight down on every place at once.
+const SURFACE = TRACE + SKY + `
 uniform sampler2D uD1, uD2, uD3, uSh, uW, uAir, uAirPass, uG;
 uniform vec4 uBrush, uCraft[10], uPing; uniform float uBrushR, uBase, uPart; uniform vec2 uTurn; uniform vec3 uSite, uPort;
 out vec4 o;
@@ -700,6 +713,14 @@ vec3 route(vec3 up){
     if(off<best.x) best = vec3(off, h, g.y);
   }
   return best;
+}
+
+// What is drawn on the world without being part of it: the ring under the hand, and two ripples
+// spreading from wherever something has just happened for the first time.
+vec3 marks(vec3 up, float px){
+  float ring = sqrt(2.*max(1.-dot(up, uBrush.xyz), 0.))*R/uBrushR, ripple = sqrt(2.*max(1.-dot(up, uPing.xyz), 0.))-.035*uPing.w, fade = max(1.-uPing.w/9., 0.);
+  return vec3(1., .8, .55)*(uBrush.w*(.5*(1.-smoothstep(0., .05, abs(ring-1.2)))+.1*exp(-ring*ring))
+                           +1.5*fade*fade*(1.-smoothstep(0., .004+2.*px/R, min(abs(ripple), abs(ripple+.05)))));
 }
 
 vec3 shade(vec3 p, vec3 rd, float t){
@@ -861,12 +882,7 @@ vec3 shade(vec3 p, vec3 rd, float t){
     float strung = sh.z*(.25+smoothstep(.35, .7, noise(p*2.9+uSeed.zxy))), fleet = streets(p*2.3, up, px*2.3, .02*smoothstep(.04, .25, textureLod(uD3, uv, 3.).x)).x;
     col += night*vec3(1., .72, .42)*((1.-wet)*5.*mix(strung, lamps+traffic, a1)+wet*mix(5.*sh.z*step(.9, noise(p*2.3)), 3.*fleet+5.*traffic, a1));
   }
-  float ring = sqrt(2.*max(1.-dot(up, uBrush.xyz), 0.))*R/uBrushR;
-  col += vec3(1., .8, .55)*uBrush.w*(.5*(1.-smoothstep(0., .05, abs(ring-1.2)))+.1*exp(-ring*ring))*(.2+.2*sun.r+.15*night);
-  // Two ripples spread from wherever something has just happened for the first time.
-  float ripple = sqrt(2.*max(1.-dot(up, uPing.xyz), 0.))-.035*uPing.w, fade = max(1.-uPing.w/9., 0.);
-  col += vec3(1., .8, .55)*fade*fade*(1.-smoothstep(0., .004+2.*px/R, min(abs(ripple), abs(ripple+.05))))*(.3+.3*sun.r+.3*night);
-  return col;
+  return col+marks(up, px)*(.2+.2*sun.r+.15*night);
 }
 
 // The cloud layer is a thin shell crossed in four steps. Thicker cover towers higher, and one
@@ -980,13 +996,16 @@ vec3 craft(vec3 rd, float depth){
     sum += (w>0. ? vec3(1., .7, .4) : vec3(.8, .9, 1.))*abs(w)*(exp(-d)+.05/(1.+d));
   }
   return sum;
-}
+}`;
 
+const RENDER = SURFACE + `
+uniform float uHide;                               // how far the planet has dissolved, to be drawn unfolded instead
 void main(){
-  vec3 rd = viewRay(); float t, tm = sphere(uRo-uMoon.xyz, rd, RM).x; bool hit = scene(uRo, rd, t);
+  vec3 rd = viewRay(); float t, tm = sphere(uRo-uMoon.xyz, rd, RM).x; bool hit = uHide<1. && scene(uRo, rd, t);
   bool lunar = tm>0. && tm<FAR && (!hit || tm<t);
   if(lunar) hit = false;
   vec3 col = lunar ? moon(rd, tm) : hit ? shade(uRo+rd*t, rd, t) : space(rd);
+  if(uHide>=1.){ o = vec4(col, 0.); return; }      // nothing left here but what was behind it
   // The air layer is a third of this size. For a pixel on the ground, favour those of its four
   // nearest texels whose march stopped at a similar depth, so haze behind a ridge does not smear
   // across its edge. A pixel of open space takes them all, which keeps the limb smooth.
@@ -1000,7 +1019,74 @@ void main(){
   }
   if(lunar){ glow = vec3(0.); pass = vec3(total); }   // none of the planet's air lies in front of the moon
   vec4 cl = clouds(uRo, rd, depth);
-  o = vec4((col*pass+glow)/max(total, 1e-6)*(1.-cl.a)+cl.rgb+aurora(uRo, rd, depth)+craft(rd, depth), hit ? t : 0.);   // depth 0 marks space
+  col = (col*pass+glow)/max(total, 1e-6)*(1.-cl.a)+cl.rgb+aurora(uRo, rd, depth)+craft(rd, depth);
+  if(uHide>0. && !lunar) col = mix(col, space(rd), uHide);
+  o = vec4(col, hit ? t : 0.);                       // depth 0 marks space
+}`;
+
+// The planet as a sheet of paper: a grid of points that can stand on the sphere, lie flat as the
+// square map they are stored in, or be anywhere between. In between, the southern hemisphere
+// peels open along four meridians, like the petals of a flower, and the north settles flat.
+const GRID = 128, PAPER = `
+uniform sampler2D uD0; uniform vec3 uRo, uCr, uCu, uCf; uniform float uFold;
+out vec2 vE;
+void main(){
+  int q = gl_VertexID/6, k = gl_VertexID%6;        // which square of the grid, and which corner of its two triangles
+  vE = (vec2(q%${GRID}, q/${GRID})+vec2(k==1 || k==2 || k==5, k==1 || k==4 || k==5))/${GRID}.;
+  vec3 n = decode(vE); vec2 e = vE*2.-1.;
+  float rise = ZS*dot(textureLod(uD0, gut(n, N), ${Math.log2(N / GRID).toFixed(1)}).xy, vec2(1.));
+  vec3 w = mix(n*(R+rise), vec3(e.x*${FLAT}*R, rise, e.y*${FLAT}*R), uFold)-uRo;
+  float z = dot(w, uCf);
+  gl_Position = vec4(dot(w, uCr)/dot(uCr, uCr), dot(w, uCu)/dot(uCu, uCu), 1.02*z-.4*R, z);
+}`;
+
+const MAP = SURFACE + `
+in vec2 vE; uniform float uFold, uSheet;
+vec4 way(ivec2 q){ return texelFetch(uG, wrap(q, M), 0); }
+// What the machine holds, a sheet at a time, drawn the way a survey would draw it.
+vec3 chart(vec3 up, vec2 uv, float cells){
+  float lod = log2(max(cells, 1.));
+  vec4 c = textureLod(uD0, uv, lod), g = textureLod(uD1, uv, 0.), f = textureLod(uD2, uv, lod), life = textureLod(uD3, uv, lod),
+       sh = textureLod(uSh, uv, 0.), w = textureLod(uW, gut(up, NW), 0.);
+  float h = c.x-uSea, land = smoothstep(-.2, .2, h), coast = 1.-smoothstep(0., 1.5*fwidth(h)+1e-3, abs(h));
+  vec3 col = mix(vec3(.012, .02, .035), vec3(.045, .04, .038), land);
+  if(uSheet<1.5){                                   // rock: height, in contours and relief, and what is still molten
+    float line = 1.-smoothstep(0., 1.5*fwidth(h)+1e-3, abs(fract(h/5.+.5)-.5)*5.);
+    col = h<0. ? mix(vec3(.01, .025, .05), vec3(.035, .11, .17), smoothstep(-11., 0., h)) : mix(vec3(.17, .14, .11), vec3(.9, .85, .76), smoothstep(0., 40., h));
+    col *= clamp(1.+1.3*dot(tangent(normalize(g.xyz), up), vec3(-.6, .5, .6))/ZS, .45, 1.6);
+    col += col*line+vec3(2.6, .42, .03)*life.z*life.z;
+  } else if(uSheet<2.5){                            // water: depth, current, silt, and the tide going round
+    col = mix(col, vec3(.02, .09, .16)*(1.+.8*tide(up)/uTide.w), (1.-land)*smoothstep(0., 9., c.y));
+    col += vec3(.1, .55, .7)*smoothstep(.03, .7, c.w)*(1.-land)+vec3(.35, .85, 1.)*land*smoothstep(.01, .08, c.y)*(.5+.8*smoothstep(0., .5, c.w));
+    col += vec3(.7, .4, .12)*.5*min(g.w*22., 1.)*smoothstep(.05, .4, c.y);
+  } else if(uSheet<3.5){                            // weather: moisture, cloud, rain, ash, and where it freezes
+    float T = temperature(up, c.x);
+    col += vec3(.04, .1, .28)*w.b;
+    col = mix(mix(col, vec3(.75, .8, .88), .85*w.r), vec3(.4, .26, .2), w.a)+vec3(.2, .7, 1.)*2.*w.g;
+    col += vec3(.5, .7, 1.)*.5*(1.-smoothstep(0., 1.5*fwidth(T)+1e-4, abs(T)));
+  } else if(uSheet<4.5){                            // life: soil from dry to moist, what grows on it, and the ice
+    col = mix(col, mix(mix(vec3(.2, .13, .07), vec3(.07, .17, .19), life.y), vec3(.1, .36, .09), c.z), land);
+    col = mix(col, vec3(.75, .86, 1.), smoothstep(.02, .5, f.w));
+  } else {                                          // the way to town: the toll in contours, the traffic it gathers, the people
+    vec2 q = encode(up)*N-.5, fr = fract(q); ivec2 i = ivec2(floor(q));
+    float toll = mix(mix(way(i).x, way(i+ivec2(1, 0)).x, fr.x), mix(way(i+ivec2(0, 1)).x, way(i+ivec2(1, 1)).x, fr.x), fr.y);
+    float reach = 1.-toll/(.4*N), steep = fwidth(toll), line = (1.-smoothstep(0., 1.5*steep+1e-3, abs(fract(toll/16.+.5)-.5)*16.))*(1.-smoothstep(2., 6., steep));
+    col += vec3(.9, .5, .16)*reach*(.25*reach+.5*line)+vec3(1., .8, .5)*1.5*sh.z+vec3(1., .95, .85)*1.5*life.x;
+  }
+  return col+vec3(.3)*coast;
+}
+void main(){
+  vec3 up = decode(vE), col; vec2 uv = gut(up, N), e = abs(vE*2.-1.);
+  float cells = N*max(length(dFdx(vE)), length(dFdy(vE))), t = cells*uRes.y/(2.*length(uCu));   // map cells to a pixel, and how far off the eye would be to see them so
+  if(uSheet<.5){                                    // the world itself, with the eye over every place at once
+    vec4 c = textureLod(uD0, uv, 0.); vec3 p = up*(R+ZS*(c.x+c.y)), eye = up*4.*R;
+    float reach = 4.*R-length(p); vec4 cl = clouds(eye, -up, reach);
+    col = shade(p, -up, t)*(1.-cl.a)+cl.rgb+aurora(eye, -up, reach);
+  } else col = chart(up, uv, cells)+marks(up, cells);
+  if(!gl_FrontFacing) col *= .25;                   // the inside of the shell, while it is open
+  // The creases it folds along are the edges of an octahedron: a square, a diamond in it, and a cross in that.
+  float crease = min(min(e.x, e.y), min(abs(e.x+e.y-1.)*.7071, 1.-max(e.x, e.y)));
+  o = vec4(col+vec3(1., .8, .55)*.2*uFold*uFold*(1.-smoothstep(0., 3.*cells/N, crease)), 0.);
 }`;
 
 const POST = {};
@@ -1088,6 +1174,7 @@ const look = { h: 0, veg: 0, rain: 0, people: 0, fire: 0, hit: false, dir: [0, 0
 const stamp = () => 1 + world.clock / 16;       // the date, as the lava map records it
 const brush = { dir: [0, 0, 1], target: [0, 0, 1], s: 0, radius: 20, glow: 0, vent: 0 };
 const cam = { az: 0, lat: .3, dist: 4.7 * R, azT: 0, latT: .3, distT: 4.7 * R, drift: 1, tanV: .29, pull: 0, away: 0, awayT: 0, yaw: 0, pitch: 0 };
+const atlas = { fold: 0, to: 0, sheet: 0 };   // the world unfolded into its map: how far, which way it is going, and which sheet is showing
 const EYE = .008 * R, LOOKOUT = 1.53, SITE = 1.44, PORT = .95;   // on the moon: the height of the eye, and how far round from the point beneath the planet it stands, they land, and their light shows from home
 const sun = { angle: 0, dir: [0, 0, 1] };
 const moon = { angle: 0, dir: [0, 0, 1], pos: [0, 0, MOON_D], light: 0, base: 0, site: [1, 0, 0], port: [1, 0, 0], up: [1, 0, 0], stand: [1, 0, MOON_D] };
@@ -1121,7 +1208,7 @@ function newWorld(s) {
 
 // Time runs faster the further back you stand: ages from orbit, an afternoon up close.
 function updateTime(dt) {
-  world.far = smooth(NEAR, .8 * FARD, cam.dist);
+  world.far = Math.max(smooth(NEAR, .8 * FARD, cam.dist), atlas.fold);   // the map is read from far off, whatever height it was opened at
   world.pace = (1 + 5 * world.far ** 2) * (keys.t ? 10 : 1);
   const t = world.dt = dt * world.pace;
   world.time += dt; world.clock += t; world.age += Math.max(t, 3 * dt);   // the afternoon may slow, but history does not wait that long
@@ -1263,7 +1350,7 @@ function updateCamera(dt) {
   const turnKey = (keys.arrowleft || keys.a ? 1 : 0) - (keys.arrowright || keys.d ? 1 : 0);
   const tiltKey = (keys.arrowup || keys.w ? 1 : 0) - (keys.arrowdown || keys.s ? 1 : 0);
   const reach = (cam.dist - R) / R;                    // the surface should move under a finger at the finger's speed
-  cam.drift += ((gesture || turnKey ? 0 : 1) - cam.drift) * ease(dt, 2.5);   // hold still while a hand is on the world
+  cam.drift += ((gesture || turnKey || atlas.to ? 0 : 1) - cam.drift) * ease(dt, 2.5);   // hold still while a hand is on the world
   if (cam.awayT) turn(turnKey * dt * 180, tiltKey * dt * 120);
   else {
     cam.azT += dt * (turnKey * .9 * reach + cam.drift * .015 * reach ** .7);   // drift slowly when close, so the ground does not slide away
@@ -1275,6 +1362,7 @@ function updateCamera(dt) {
   cam.az += (cam.azT - cam.az) * k; cam.lat += (cam.latT - cam.lat) * k;
   cam.dist += (cam.distT * (1 + .25 * (cam.awayT ? 0 : cam.pull)) - cam.dist) * k;   // the limit gives a little before it gives way
   cam.away += (cam.awayT - cam.away) * ease(dt, 1.3);
+  atlas.fold = clamp(atlas.fold + (atlas.to ? dt : -dt) / 3.4, 0, 1);
   const cl = Math.cos(cam.lat), out = [cl * Math.sin(cam.az), Math.sin(cam.lat), cl * Math.cos(cam.az)];
   const east = norm(cross([0, 1, 0], out)), north = cross(out, east), aspect = canvas.width / canvas.height;
   cam.tanV = .29 * Math.max(1, 1.2 / aspect);          // a long lens; wider on portrait screens
@@ -1296,15 +1384,28 @@ function updateCamera(dt) {
     upward = norm(add(scale(upward, 1 - a), scale(moon.up, a)));
     cam.tanV += (wide - cam.tanV) * a;
   }
+  const over = smooth(0, .8, atlas.fold);
+  if (over > 0) {
+    // Unfolded, the world is a square sheet lying in the plane of the equator. The camera swings
+    // up over the north pole to look straight down on it, and squares itself up with its edges.
+    const d = Math.hypot(...pos), here = scale(pos, 1 / d), high = 1.08 * FLAT * R / (cam.tanV * Math.min(1, aspect)), quarter = Math.round(cam.az / (Math.PI / 2)) * Math.PI / 2;
+    const path = swing(here, [0, 1, 0], over);
+    pos = scale(path, d + (high - d) * over);
+    f = norm(add(scale(path, -1), scale(add(f, here), 1 - over)));       // keep facing the planet all the way round
+    upward = norm(add(scale(upward, 1 - over), scale([-Math.sin(quarter), 0, -Math.cos(quarter)], over)));
+  }
   const right = norm(cross(f, upward));
   cam.pos = pos; cam.f = f;
   cam.r = scale(right, cam.tanV * aspect); cam.u = scale(cross(right, f), cam.tanV);
 }
-// Wheel and pinch. At the far limit, or on the moon, they add up to a pull instead of a distance.
+// Wheel and pinch. At the far limit, on the moon or over the map, they add up to a pull instead
+// of a distance: outward to leave for the moon, inward to come back from wherever this is.
 function zoom(k) {
-  if (!cam.awayT && (cam.distT < FARD || k < 1)) { cam.distT = Math.min(FARD, R + (cam.distT - R) * k); cam.pull = 0; return; }
-  cam.pull = clamp(cam.pull + Math.log(k), cam.awayT ? -1 : 0, cam.awayT ? 0 : 1);
+  const elsewhere = cam.awayT || atlas.to;
+  if (!elsewhere && (cam.distT < FARD || k < 1)) { cam.distT = Math.min(FARD, R + (cam.distT - R) * k); cam.pull = 0; return; }
+  cam.pull = clamp(cam.pull + Math.log(k), elsewhere ? -1 : 0, elsewhere ? 0 : 1);
   if (Math.abs(cam.pull) < .3) return;
+  if (atlas.to) return tour(true);
   cam.awayT = 1 - cam.awayT; cam.pull = cam.yaw = cam.pitch = 0;
   tool.style.opacity = cam.awayT ? 0 : .8;
   if (cam.awayT) say('drag to look round  ·  zoom in to return', 9);
@@ -1326,6 +1427,7 @@ const carving = () => pointer.carve || keys.shift || tool.classList.contains('ca
 const spread = () => { const [a, b] = [...touches.values()]; return Math.hypot(a.x - b.x, a.y - b.y); };
 function turn(dx, dy) {
   const k = (cam.dist - R) / R * 2 * cam.tanV / innerHeight;
+  if (atlas.to) return;                                  // the map stays put
   if (cam.awayT) { cam.yaw = clamp(cam.yaw + dx * .004, -2.7, 2.7); cam.pitch = clamp(cam.pitch + dy * .004, -.3, 1); }
   else { cam.azT -= dx * k / Math.max(.3, Math.cos(cam.lat)); cam.latT += dy * k; }
 }
@@ -1362,10 +1464,14 @@ canvas.addEventListener('contextmenu', e => e.preventDefault());
 addEventListener('gesturestart', e => e.preventDefault());   // iOS Safari: keep pinches for the planet, not the page
 canvas.addEventListener('wheel', e => { e.preventDefault(); idle = 0; zoom(Math.exp(e.deltaY * .0015)); }, { passive: false });
 tool.addEventListener('click', () => tool.classList.toggle('carve'));
+$('maps').addEventListener('click', () => { idle = 0; if (started) tour(); });
+$('snap').addEventListener('click', () => { idle = 0; if (started) snap(); });
 addEventListener('keydown', e => {
   const k = e.key.toLowerCase(); keys[k] = true; idle = 0;
   if (!started) return begin('mouse');
   if (k === ' ') tool.classList.toggle('carve');
+  if (k === 'u' || k === 'escape' && atlas.to) tour(k !== 'u' || e.shiftKey);
+  if (k === 'p') snap();
   if (k === 'n') newWorld(1 + Math.floor(Math.random() * 36 ** 4));
   if (k === 'm' && audio.out) audio.out.gain.setTargetAtTime((audio.muted = !audio.muted) ? 0 : .9, audio.ac.currentTime, .2);
 });
@@ -1375,7 +1481,8 @@ addEventListener('blur', () => { for (const k in keys) keys[k] = false; });
 function begin(kind) {
   started = true;
   startAudio();
-  $('veil').style.opacity = 0; tool.style.opacity = .8;
+  $('veil').style.opacity = 0;
+  for (const knob of document.querySelectorAll('.knob')) Object.assign(knob.style, { opacity: knob === tool ? .8 : .6, pointerEvents: 'auto' });
   say(kind === 'touch' ? 'drag the sea to raise land  ·  drag space to turn  ·  pinch to descend'
                        : 'drag the sea to raise land  ·  shift-drag to carve  ·  scroll to descend', 12);
 }
@@ -1393,6 +1500,25 @@ function tell(what, text, at) {
   say(text, 8);
   if (at) Object.assign(ping, { dir: at, t: 0 });
   if (audio.ac && at) pluck(noteAt(7), .03, 0, 6);
+}
+
+// The map button is a tour of the machine: the world unfolds into the square it is stored in,
+// shows one by one the sheets it is made of, and folds up again. The hand works on all of them.
+const SHEETS = ['the world, unfolded', 'rock', 'water', 'weather', 'life', 'the way to town'];
+function tour(end) {
+  if (!P.map) try { P.map = program(HEAD + MAP, compile(gl.VERTEX_SHADER, HEAD + PAPER)); }   // a large program, so not compiled until asked for
+    catch (e) { $('veil').style.opacity = 0; return say('the map will not open on this GPU', 6); }
+  if (!atlas.to) Object.assign(atlas, { to: 1, sheet: 0 });
+  else if (end || atlas.sheet === SHEETS.length - 1) atlas.to = 0;
+  else atlas.sheet++;
+  cam.awayT = cam.pull = 0; tool.style.opacity = .8;
+  if (gesture) gesture = 'orbit';
+  say(atlas.to ? SHEETS[atlas.sheet] + (atlas.sheet ? '' : '  ·  again for what it is made of') : '', 8);
+}
+// Where a ray from the camera meets the unfolded map: a place on the planet, or nothing if it misses the sheet.
+function onMap(rd) {
+  const t = -cam.pos[1] / rd[1], x = (cam.pos[0] + rd[0] * t) / (FLAT * R), z = (cam.pos[2] + rd[2] * t) / (FLAT * R);
+  return Math.max(Math.abs(x), Math.abs(z)) < 1 ? decode(x * .5 + .5, z * .5 + .5) : null;
 }
 
 // When nobody is here, an unseen hand keeps working, so the piece is never a still.
@@ -1440,7 +1566,8 @@ function updateBrush(dt) {
   look.dir = onSphere(cam.f, R); look.range = Math.hypot(...add(cam.pos, scale(look.dir, -R)));
   draw(P.pick, toPick, { ...eye(), uW: weather[0].tex, uD3: D[3], uRd: rd, uProbe: brush.dir, uLook: cam.f });
   gl.readPixels(0, 0, 4, 1, gl.RGBA, gl.FLOAT, pickBuf);
-  const hit = pickBuf[3] > 0, at = [pickBuf[0], pickBuf[1], pickBuf[2]];
+  const flat = atlas.fold === 1, spot = flat && onMap(rd);          // unfolded, the pointer lands on the map instead
+  const hit = flat ? !!spot : pickBuf[3] > 0 && !atlas.fold, at = spot || [pickBuf[0], pickBuf[1], pickBuf[2]];
   Object.assign(world, { h: pickBuf[4] - world.sea, water: pickBuf[5], speed: pickBuf[7] });
   Object.assign(look, { h: pickBuf[8], veg: pickBuf[9], rain: pickBuf[10], hit: pickBuf[11] > 0, people: pickBuf[12], fire: pickBuf[14] });
   if (frameCount % 30 === 0) census();
@@ -1454,7 +1581,7 @@ function updateBrush(dt) {
   if (gesture === 'sculpt') {
     // Drag along the sphere through the first touch: the land rising under the pointer must
     // not pull the brush toward the camera.
-    brush.target = onSphere(rd, pointer.anchor);
+    brush.target = flat ? spot || brush.target : onSphere(rd, pointer.anchor);
     want = carving() ? -1 : 1; glow = 1;
   } else if (idle > 18 || !started) want = haunt(dt);
   else if (pointer.hover && !gesture && hit && cam.away < .02) { brush.target = norm(at); glow = .35; }
@@ -1470,25 +1597,33 @@ function updateBrush(dt) {
 // ───────────────────────────────────────────────────────────── adaptive quality
 // The picture is rendered at a fraction of the canvas and scaled so that frames never drop. If
 // that is not enough, the simulation slows down too: the world just ages more gently.
-const view = { scale: 0, sim: 1, ema: 1 / 60, timer: 0, calm: 0, ceiling: 1 };
+const view = { scale: 0, perPixel: 1, sim: 1, ema: 1 / 60, timer: 0, calm: 0, ceiling: 1, slow: false };
 function resize() {
   const dpr = Math.min(devicePixelRatio || 1, 2);
-  canvas.width = Math.round(innerWidth * dpr); canvas.height = Math.round(innerHeight * dpr);
-  if (!view.scale) view.scale = clamp(Math.sqrt(6e5 / (canvas.width * canvas.height)), .3, 1);   // start modest, then climb
+  size(dpr, view.scale || clamp(Math.sqrt(6e5 / (innerWidth * innerHeight * dpr * dpr)), .3, 1));   // start modest, then climb
+}
+function size(perPixel, scale) {     // the canvas in device pixels per CSS pixel, and the fraction of it that is rendered
+  canvas.width = Math.round(innerWidth * perPixel); canvas.height = Math.round(innerHeight * perPixel);
+  Object.assign(view, { perPixel, scale });
   buildTargets();
 }
 function buildTargets() {
-  for (const t of view.targets || []) { t.textures.forEach(x => gl.deleteTexture(x)); gl.deleteFramebuffer(t.fbo); }
+  for (const t of view.targets || []) { t.textures.forEach(x => gl.deleteTexture(x)); gl.deleteFramebuffer(t.fbo); gl.deleteRenderbuffer(t.depth || null); }
   const w = Math.max(2, Math.round(canvas.width * view.scale)), h = Math.max(2, Math.round(canvas.height * view.scale));
   const third = () => texture(Math.ceil(w / 3), Math.ceil(h / 3), gl.RGBA16F, gl.NEAREST);
   view.scene = target(texture(w, h, gl.RGBA16F, gl.LINEAR));
+  view.scene.depth = gl.createRenderbuffer();          // only the unfolding map, which is a surface and not a ray march, needs depth
+  gl.bindRenderbuffer(gl.RENDERBUFFER, view.scene.depth); gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT24, w, h);
+  gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, view.scene.depth);
   view.ldr = target(texture(w, h, gl.RGBA8, gl.LINEAR));
   view.air = target(third(), third());
   view.bloom = [1, 2, 3, 4, 5].map(i => target(texture(Math.max(1, w >> i), Math.max(1, h >> i), gl.RGBA16F, gl.LINEAR)));
   view.targets = [view.scene, view.ldr, view.air, ...view.bloom];
 }
-function adapt(dt) {
-  if (dt > .1) return;                           // a hitch or a tab switch says nothing about the GPU
+function adapt(elapsed) {
+  const dt = Math.min(elapsed, .05), hitch = elapsed > .05 && !view.slow;
+  view.slow = elapsed > .05;
+  if (hitch) return;                             // one long frame is a hitch, a tab switch or a photograph, and says nothing about the GPU; two running do
   view.ema += (dt - view.ema) * .06; view.timer += dt; view.calm += dt;
   if (view.timer < .7) return;
   view.timer = 0;
@@ -1503,14 +1638,24 @@ function adapt(dt) {
 }
 addEventListener('resize', resize);
 
-function render() {
-  const { scene, ldr, bloom, air } = view, res = [scene.w, scene.h];
+function render(still) {         // still: for a photograph, without the marks of the hand
+  const { scene, ldr, bloom, air } = view, res = [scene.w, scene.h], hide = smooth(.15, .35, atlas.fold);
   const shared = { ...eye(), uSun: sun.dir, uW: weather[0].tex, uFlash: flashData, uMoon: [...moon.pos, moon.light],
     uTurn: [Math.cos(moon.angle), Math.sin(moon.angle)], uBase: moon.base };
-  draw(P.air, air, { ...shared, uRes: [air.w, air.h] });
-  draw(P.render, scene, { ...shared, uD1: D[1], uD2: D[2], uD3: D[3], uSh: toShadow.tex, uG: lives[0].textures[1], uAir: air.tex, uAirPass: air.textures[1],
-    uRes: res, uBrush: [...brush.dir, brush.glow * .55], uBrushR: brush.radius, uPart: Math.min(1, 1.5 * Math.abs(brush.s)), uCraft: craftData,
-    uSite: moon.site, uPort: moon.port, uPing: [...ping.dir, ping.t] });
+  const surface = { ...shared, uD1: D[1], uD2: D[2], uD3: D[3], uSh: toShadow.tex, uG: lives[0].textures[1], uAir: air.tex, uAirPass: air.textures[1],
+    uRes: res, uBrush: [...brush.dir, still ? 0 : brush.glow * .55], uBrushR: brush.radius, uPart: Math.min(1, 1.5 * Math.abs(brush.s)), uCraft: craftData,
+    uSite: moon.site, uPort: moon.port, uPing: [...ping.dir, still ? 9 : ping.t] };
+  if (hide < 1) draw(P.air, air, { ...shared, uRes: [air.w, air.h] });
+  draw(P.render, scene, { ...surface, uHide: hide });
+  if (hide > 0) {
+    // The picture of the planet gives way to the planet as a sheet: first standing on the sphere
+    // where the picture was, then opening. Closed, it is drawn one-sided so that it can fade in.
+    gl.enable(gl.DEPTH_TEST); gl.clear(gl.DEPTH_BUFFER_BIT);
+    gl.enable(gl.BLEND); gl.blendColor(0, 0, 0, hide); gl.blendFunc(gl.CONSTANT_ALPHA, gl.ONE_MINUS_CONSTANT_ALPHA);
+    if (hide < 1) gl.enable(gl.CULL_FACE);
+    draw(P.map, scene, { ...surface, uFold: smooth(.35, 1, atlas.fold), uSheet: atlas.sheet }, 6 * GRID * GRID);
+    gl.disable(gl.CULL_FACE); gl.disable(gl.BLEND); gl.disable(gl.DEPTH_TEST);
+  }
   // Bloom: threshold, walk down a pyramid, then add each level back into the one above.
   let src = scene;
   bloom.forEach((b, i) => { draw(P.blur, b, { uT: src.tex, uRes: [b.w, b.h], uSpread: .5, uKnee: i ? 0 : 1.1 }); src = b; });
@@ -1518,14 +1663,42 @@ function render() {
   for (let i = bloom.length - 1; i > 0; i--)
     draw(P.blur, bloom[i - 1], { uT: bloom[i].tex, uRes: [bloom[i - 1].w, bloom[i - 1].h], uSpread: 1, uKnee: 0 });
   gl.disable(gl.BLEND);
-  // Expose for what the camera faces: the night side wants a wider aperture.
-  // From the moon it is the planet's phase that counts, unless the ground underfoot is in the sun.
+  // Expose for what the camera faces: the night side wants a wider aperture. From the moon it is
+  // the planet's phase that counts, unless the ground underfoot is in the sun. The map shows both
+  // day and night at once, and gets something in between.
   const facing = .5 * dot(add(look.dir, norm(cam.pos)), sun.dir), noon = smooth(-.1, .2, dot(moon.up, sun.dir));
   const here = .5 + 1.4 * (1 - smooth(-.45, .25, facing)) * (1 - .5 * world.far), there = .5 + .8 * (1 - smooth(-.6, .2, dot(moon.dir, sun.dir))) * (1 - noon);
   const exposure = here + (there - here) * cam.away;
-  draw(P.lens, ldr, { uScene: scene.tex, uBloom: bloom[0].tex, uRes: res, uExposure: exposure, uFocus: look.range,
-    uBlur: 1 - smooth(NEAR, R + 4 * (NEAR - R), cam.dist) });
+  draw(P.lens, ldr, { uScene: scene.tex, uBloom: bloom[0].tex, uRes: res, uExposure: exposure + (.8 - exposure) * hide, uFocus: look.range,
+    uBlur: (1 - smooth(NEAR, R + 4 * (NEAR - R), cam.dist)) * (1 - hide) });
   draw(P.present, null, { uTime: world.time, uImg: ldr.tex, uRes: [canvas.width, canvas.height], uSrc: res, uVeil: started ? 0 : 1 });
+}
+
+// A photograph: the same picture rendered once at up to three times the screen's size, without
+// the marks of the hand, signed in a corner, and handed to the share sheet or saved as a file.
+// Everything happens inside the press that asked for it, which is what lets a phone share it.
+function snap() {
+  const was = [view.perPixel, view.scale], longest = Math.max(innerWidth, innerHeight), still = document.createElement('canvas'), pen = still.getContext('2d');
+  try {
+    size(Math.min(3, Math.sqrt((coarse ? 4e6 : 8e6) / (innerWidth * innerHeight)), gl.getParameter(gl.MAX_TEXTURE_SIZE) / longest), 1);
+    render(true);
+    still.width = canvas.width; still.height = canvas.height;
+    pen.drawImage(canvas, 0, 0);
+  } finally { size(...was); render(); }
+  const em = Math.max(still.width, still.height) / 100, name = 'orogeny-' + seed.toString(36);
+  pen.font = `300 ${em}px "Helvetica Neue", Helvetica, Arial, sans-serif`; pen.fillStyle = 'rgba(246, 238, 226, .7)';
+  pen.shadowColor = 'rgba(0, 0, 0, .7)'; pen.shadowBlur = .8 * em;                       // legible on pale ground too
+  let x = 2.5 * em;
+  for (const letter of name.replace('-', '   ').toUpperCase()) { pen.fillText(letter, x, still.height - 2.5 * em); x += pen.measureText(letter).width + .42 * em; }
+  const bytes = Uint8Array.from(atob(still.toDataURL('image/jpeg', .92).split(',')[1]), ch => ch.charCodeAt(0));
+  const file = new File([bytes], `${name}-${Math.round(world.time)}.jpg`, { type: 'image/jpeg' });
+  canvas.animate([{ filter: 'brightness(2.4)' }, { filter: 'brightness(1)' }], 450);    // the shutter
+  if (audio.ac) pluck(1900, .02, 0, .06);
+  if (coarse && navigator.canShare && navigator.canShare({ files: [file] })) navigator.share({ files: [file] }).catch(() => {});
+  else {
+    const link = Object.assign(document.createElement('a'), { href: URL.createObjectURL(file), download: file.name });
+    link.click(); setTimeout(() => URL.revokeObjectURL(link.href), 3e4);
+  }
 }
 
 // ───────────────────────────────────────────────────────────── sound
@@ -1654,9 +1827,9 @@ function updateAudio(dt) {
 // ───────────────────────────────────────────────────────────── main loop
 let last = 0;
 function frame(now) {
-  const dt = clamp((now - last) / 1000, 0, .05); last = now;
+  const elapsed = Math.max(now - last, 0) / 1000, dt = Math.min(elapsed, .05); last = now;
   idle += dt; frameCount++; ping.t += dt;
-  adapt(dt);
+  adapt(elapsed);
   updateTime(dt);
   updateCamera(dt);                              // after the moon has moved: the camera may be standing on it
   updateWeather(dt);
@@ -1668,7 +1841,7 @@ function frame(now) {
   requestAnimationFrame(frame);
 }
 canvas.addEventListener('webglcontextlost', e => { e.preventDefault(); $('veil').style.opacity = 1; $('go').textContent = 'the graphics context was lost — reload to continue'; });
-if (matchMedia('(pointer: coarse)').matches) $('go').textContent = 'touch to begin';
+if (coarse) $('go').textContent = 'touch to begin';
 newWorld(seed);
 resize();
 updateCamera(0);

@@ -21,6 +21,8 @@ step, no assets. Every pixel and every sample is generated at runtime (WebGL2 + 
 | Drag on space, arrow keys / WASD | Turn the planet |
 | Wheel or pinch | Descend until the mountains fill the view, or pull back |
 | Keep pulling back past the far limit | Go to the moon and look home; drag to look round, zoom in to return |
+| U, or the map button | Unfold the planet into the square map it is computed in. Again for each layer of the simulation; zoom in or Esc to fold it up. You can sculpt on the map |
+| P, or the shutter button | A photograph: the same view at up to 8 megapixels, without the interface, saved or shared |
 | N | New world (the seed is in the URL hash) |
 | M | Mute |
 | Hold T | Fast-forward |
@@ -50,6 +52,25 @@ fire, a city, a departure, a landing) with a ripple on the ground where it happe
   arriving comes down out of the planet's own disc.
 
 Ice ages still come and go, and they can undo most of it.
+
+## The machine, unfolded
+
+![The planet opening into its map](shots/unfolding.jpg)
+
+The planet is not a model with a texture on it. It *is* a square texture, and the map button
+shows that literally: the sphere opens along four meridians of its southern hemisphere, like a
+flower, and lies flat as the square the simulation runs in, north pole at the centre and the
+south pole at all four corners. The creases drawn on it are the edges of the octahedron it
+folds through. Day, night, weather and city lights carry on across it, and the hand works on it
+as it does on the globe.
+
+Press again and it shows what it is made of, a layer at a time: rock (height in contours, lava
+still molten), water (depth, currents, silt, the two tides going round), weather (moisture,
+cloud, rain, ash, the frost line), life (soil, vegetation, ice), and the way to town (the toll
+field in contours, the traffic it gathers, the people).
+
+![The world, unfolded](shots/unfolded.jpg)
+![The way to town](shots/way-to-town.jpg)
 
 ## How it works
 
@@ -94,6 +115,9 @@ One rule is used four times: a cell hands something to a lower neighbour.
   the ground cuts three families of planes, so each district gets a square or triangular plan
   at its own angle. A road becomes the exact chain of cell-to-cell steps its travellers take,
   with lamps at even paces and headlights running toward town.
+- **The map.** The unfolded view is a 128×128 mesh whose every vertex can stand on the sphere,
+  lie flat in the square, or be anywhere between. It is shaded by the same function as the
+  ray-marched picture, called with the eye straight above every point at once.
 - **The moon.** A sphere with craters in the cells of a grid, in sizes from a third of its
   width down to whatever a pixel can show, so it holds up from orbit and from its own ground.
   The outpost reuses the towns' street plan.
