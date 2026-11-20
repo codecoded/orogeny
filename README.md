@@ -29,5 +29,11 @@ slumping; shadows and ambient occlusion are marched in the heightfield's own tex
 single raymarch renders it; and the same state, read back from the GPU, drives a synthesised
 score.
 
+Weather is part of the loop: low cloud forms where air is pushed up over high ground, so a
+mountain range you raise summons its own cloud cap, visible rain falls from it, and the heaviest
+cells throw lightning. Clouds are marched volumetrically at a third of the picture's resolution.
+
+![Cloud streaming off a raised peak](shots/weather.jpg)
+
 ![Close-up](shots/closeup-strata.jpg)
 ![Night](shots/night-glow.jpg)

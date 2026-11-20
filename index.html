@@ -131,7 +131,7 @@ void main(){
 }`;
 
 SIM.erode = NOISE + `
-uniform sampler2D uS, uV; uniform vec4 uBrush; uniform float uRain; out vec4 o;
+uniform sampler2D uS, uV, uW; uniform vec4 uBrush; uniform float uRain; out vec4 o;
 vec4 S(ivec2 q){ return texelFetch(uS, clamp(q, ivec2(0), ivec2(M)), 0); }
 void main(){
   ivec2 p = ivec2(gl_FragCoord.xy); vec2 xz = gl_FragCoord.xy-.5*N;
@@ -149,7 +149,7 @@ void main(){
   float s = mix(mix(S(i).z, S(i+ivec2(1,0)).z, w.x), mix(S(i+ivec2(0,1)).z, S(i+ivec2(1,1)).z, w.x), w.y);
   float capacity = .5*length(v)*min(d*d*30., 1.)*max(slope/sqrt(1.+slope*slope), .03);
   float e = capacity-s;
-  e *= e>0. ? .1*(1.15-hard)*(1.-.75*veg) : .06;     // roots hold soil; hard rock resists
+  e *= e>0. ? .07*(1.15-hard)*(1.-.75*veg) : .06;     // roots hold soil; hard rock resists
   b -= e; s += e;
 
   // Talus: material slides to any neighbour it overhangs by more than the angle of repose.
@@ -167,8 +167,8 @@ void main(){
             : g*(.6+.8*noise(xz*.09))*smoothstep(-6.5, -3.5, b);
   veg *= 1.-min(abs(g)*2., 1.);
 
-  // It rains where clouds cross high ground; standing water above sea level slowly evaporates.
-  d += uRain*cloud(xz)*smoothstep(1., 24., b);
+  // It rains under heavy cloud; standing water above sea level slowly evaporates.
+  d += uRain*textureLod(uW, gl_FragCoord.xy/N, 0.).g*smoothstep(.5, 8., b);
   if(b+d>.35) d = max(d*.9985-.00003, 0.);
   if(border<3.){ d = max(-b, 0.); s = 0.; }   // the open sea holds the rim at sea level
 
@@ -187,6 +187,19 @@ void main(){
   float land = smoothstep(.44, .7, fbm(q*3.2+uSeed*3.)-.5*smoothstep(.12, .46, length(q)));
   float b = -3.3+.9*noise(xz*.035+uSeed)+land*(4.5+44.*land*land*(ridged(xz*.022+uSeed)+.4*fbm(xz*.05)));
   o = vec4(b, max(-b, 0.), 0., smoothstep(.5, 2., b)*(1.-smoothstep(10., 30., b))*smoothstep(.25, .6, noise(xz*.06+uSeed)));
+}`;
+
+// Weather: low cloud forms where moist air is pushed up over high ground, so raising a mountain
+// range summons its own cloud cap, and heavy cloud rains. One small map holds cover and rainfall;
+// the simulation, the shadows, the volumetric clouds and the sound all read it.
+SIM.weather = NOISE + `
+uniform sampler2D uD0; out vec4 o;
+void main(){
+  vec2 uv = gl_FragCoord.xy/256., xz = (uv-.5)*N, w = mat2(.8, .6, -.6, .8)*xz*.0065+uSeed.yx+uTime*vec2(.021,.009);
+  float lift = clamp(textureLod(uD0, uv, 4.).x/28., 0., 1.);
+  float n = fbm(w)+.12*(noise(w*7.+uTime*.05)-.5);
+  float cover = smoothstep(.62-.27*lift, .86-.27*lift, n)*smoothstep(0., .16, .5-max(abs(uv.x-.5), abs(uv.y-.5)));
+  o = vec4(cover, smoothstep(.45, .95, cover), 0, 1);
 }`;
 
 // What the renderer samples: filterable half-float copies of the state, plus its gradients,
@@ -222,8 +235,11 @@ void main(){
 }`;
 
 const TRACE = `
-uniform sampler2D uD0;
+uniform sampler2D uD0; uniform vec3 uRo, uCr, uCu, uCf, uFlash; uniform vec2 uRes;
 const float CEIL = 116., FLOOR = -7.;
+const float BASE = 50., TOP = 92.;   // the layer of low cloud that weather happens in
+vec3 viewRay(){ vec2 s = (gl_FragCoord.xy*2.-uRes)/uRes; return normalize(uCf+uCr*s.x+uCu*s.y); }
+vec3 flash(vec2 xz){ vec2 d = xz-uFlash.xy; return vec3(.6,.7,1.)*uFlash.z*exp(-dot(d,d)/9000.); }   // lightning
 vec4 D(vec2 xz){ return textureLod(uD0, xz/N+.5, 0.); }
 float top(vec2 xz){ vec4 c = D(xz); return c.x+c.y; }
 // Heightfield march. Talus erosion bounds the terrain's slope, so (height above ground) divided
@@ -253,7 +269,7 @@ bool scene(vec3 ro, vec3 rd, out float t){
 
 // Two pixels of ground truth for the CPU: where the pointer's ray lands, and the state under the brush.
 SIM.pick = TRACE + `
-uniform vec3 uRo, uRd; uniform vec2 uProbe; out vec4 o;
+uniform vec3 uRd; uniform vec2 uProbe; out vec4 o;
 void main(){
   if(gl_FragCoord.x>1.){ o = D(uProbe); return; }
   float t; bool hit = scene(uRo, uRd, t); vec3 p = uRo+uRd*t;
@@ -261,11 +277,12 @@ void main(){
 }`;
 
 const RENDER = NOISE + TRACE + `
-uniform sampler2D uD1, uD2, uSh;
-uniform vec3 uRo, uCr, uCu, uCf, uLight, uLightCol, uSunDir, uSunCol, uMoonDir, uGlow, uZen, uHor;
-uniform vec2 uRes; uniform vec4 uBrush; uniform float uStars, uReflect, uFog;
+uniform sampler2D uD1, uD2, uSh, uW, uClouds, uCloudDepth;
+uniform vec3 uLight, uLightCol, uSunDir, uSunCol, uMoonDir, uGlow, uZen, uHor;
+uniform vec4 uBrush; uniform float uStars, uReflect, uFog;
 out vec4 o;
-const float DECK = 420.;   // altitude of the cloud layer
+const float DECK = 420.;   // altitude of the high, thin cloud layer
+float lowCloud(vec2 xz, float y){ return 1.-.8*textureLod(uW, (xz+uLight.xz*(BASE+12.-y)/max(uLight.y, .2))/N+.5, 0.).r; }
 
 vec3 air(vec3 rd){         // clear sky: a zenith-to-horizon gradient plus forward scattering round the sun
   float mu = max(dot(rd, uSunDir), 0.), toward = .5+.5*dot(normalize(rd.xz), normalize(uSunDir.xz));
@@ -313,11 +330,11 @@ vec3 land(vec2 xz, float dist, float under){
   float caustic = 1.;
   if(under>0.){
     float k = noise(xz*.8+uTime*vec2(.3,.2))-noise(xz*.8-uTime*vec2(.25,.35)+9.);
-    caustic = 1.+1.6*pow(1.-abs(k), 9.)*exp(-.5*under);
+    caustic = 1.+1.6*pow(1.-abs(k), 9.)*exp(-.5*under)*smoothstep(.15, .7, under);   // none under a film of rain
   }
-  float cloudShade = 1.-.75*cloud(xz+uLight.xz*(DECK-b)/max(uLight.y, .08));
+  float cloudShade = (1.-.6*cloud(xz+uLight.xz*(DECK-b)/max(uLight.y, .08)))*lowCloud(xz, b);
   vec3 direct = uLightCol*max(dot(n, uLight), 0.)*sh.x*cloudShade*caustic;
-  vec3 ambient = mix(uHor*.22+alb*uLightCol*.05, uZen*.75+uHor*.3, .5+.5*n.y)*sh.y;
+  vec3 ambient = flash(xz)*(.3+.7*n.y)+mix(uHor*.22+alb*uLightCol*.05, uZen*.75+uHor*.3, .5+.5*n.y)*sh.y;
   return alb*(direct+ambient);
 }
 
@@ -346,7 +363,7 @@ vec3 shade(vec3 ro, vec3 rd, float t){
     vec2 bx = p.xz+rf.xz*d*slant*.5; float du = D(bx).y, path = .5*(d+du)*slant;
     float silt = min(f.z*22., 1.);
     vec3 ext = exp(-path*mix(vec3(2.,.55,.36), vec3(1.8,2.2,2.8), silt));
-    float lit = sh.x*(1.-.75*cloud(p.xz+uLight.xz*DECK/max(uLight.y, .08)));
+    float lit = sh.x*(1.-.6*cloud(p.xz+uLight.xz*DECK/max(uLight.y, .08)))*lowCloud(p.xz, 0.);
     vec3 inLight = uLightCol*max(uLight.y, 0.)*lit*.45+uZen*.6+uHor*.25;
     vec3 body = land(bx, t, du)*ext + mix(vec3(.002,.035,.06), vec3(.3,.21,.11), silt)*inLight*(1.-ext);
     vec3 w = mix(body, refl, fres) + uLightCol*lit*3.5*pow(max(dot(rr, uLight), 0.), 500.)*(1.-smoothstep(.1, .5, length(g.zw)));
@@ -355,11 +372,11 @@ vec3 shade(vec3 ro, vec3 rd, float t){
     // texture is carried by the current in two half-offset phases, so it flows without smearing.
     float ph = fract(uTime*.4); vec2 fl = f.xy*9.;
     float fn = mix(noise(p.xz*1.4-fl*ph), noise(p.xz*1.4-fl*fract(ph+.5)+5.), abs(1.-2.*ph));
-    float rapids = smoothstep(.45, 1.1, c.w)*(1.-smoothstep(.3, 2., d))*smoothstep(.04, .2, d);
+    float rapids = smoothstep(.45, 1.1, c.w)*(1.-smoothstep(.3, 2., d))*smoothstep(.1, .3, d);
     float surf = (1.-smoothstep(.03, .5, d))*step(c.x+d, .6)*(.55+.45*sin(uTime*1.1+6.*noise(p.xz*.06)+d*9.));
     float foam = smoothstep(.55, .9, .5*fn+max(rapids, surf));
     w = mix(w, vec3(.8,.84,.86)*(inLight+uLightCol*lit*.15), foam*.9);
-    w += uStars*vec3(.03,.5,.6)*(foam+smoothstep(.03, .3, c.w)*(.3+.7*fn));     // at night, disturbed water glows
+    w += uStars*vec3(.03,.5,.6)*(foam+smoothstep(.03, .3, c.w)*(.3+.7*fn))*(.2+.8*step(c.x+d, .6));     // at night, disturbed water glows
     col = mix(col, w, wet);
   }
   float ring = length(p.xz-uBrush.xy)/uBrush.z;
@@ -367,18 +384,74 @@ vec3 shade(vec3 ro, vec3 rd, float t){
   return mix(col, air(normalize(vec3(rd.x, .035, rd.z))), 1.-exp(-t*uFog));    // aerial perspective
 }
 
+// The cloud layer is a third of this size. Of its four nearest texels, favour those whose march
+// stopped at a depth like this pixel's, so cloud behind a ridge does not smear across its edge.
+vec4 clouds(float t){
+  ivec2 size = textureSize(uClouds, 0);
+  vec2 q = gl_FragCoord.xy*vec2(size)/uRes-.5, f = fract(q); vec4 sum = vec4(0); float total = 0.;
+  for(int k=0;k<4;k++){
+    ivec2 d = ivec2(k&1, k>>1), c = clamp(ivec2(floor(q))+d, ivec2(0), size-1);
+    float w = (d.x==1 ? f.x : 1.-f.x)*(d.y==1 ? f.y : 1.-f.y)/(.12+abs(texelFetch(uCloudDepth, c, 0).r/t-1.));
+    sum += w*texelFetch(uClouds, c, 0); total += w;
+  }
+  return sum/total;
+}
+
 void main(){
-  vec2 s = (gl_FragCoord.xy*2.-uRes)/uRes;
-  vec3 rd = normalize(uCf+uCr*s.x+uCu*s.y);
+  vec3 rd = viewRay();
   float t; bool hit = scene(uRo, rd, t);
-  if(hit){ o = vec4(shade(uRo, rd, t), t); return; }
+  vec4 haze = clouds(hit ? t : 1e5);
+  if(hit){ o = vec4(shade(uRo, rd, t)*haze.a+haze.rgb, t); return; }
   vec3 c = sky(uRo, rd);
   if(uStars>0.){                                   // one star in some cells of a grid laid over the dome
     vec2 s = rd.xz/(rd.y+.4)*120., id = floor(s); float h = hash(id);
     vec2 at = fract(s)-.5-.6*(vec2(hash(id+7.), hash(id+13.))-.5);
     c += uStars*vec3(.8,.88,1.)*step(.94, h)*(h-.93)*60.*(1.-smoothstep(0., .16, length(at)))*smoothstep(0., .1, rd.y)*(1.-cloud(uRo.xz+rd.xz*(DECK-uRo.y)/max(rd.y, .02)));
   }
-  o = vec4(c, 0.);                                 // depth 0 marks sky: the lens leaves it sharp
+  o = vec4(c*haze.a+haze.rgb, 0.);                   // depth 0 marks sky: the lens leaves it sharp
+}`;
+
+// Low cloud and falling rain, marched through the layer between the sea and the cloud tops at a
+// third of the picture's resolution: soft things survive upscaling, and that pays for fine steps.
+// Cover and rainfall come from the weather map; value noise carves the cover into heaps.
+// Output: light scattered toward the eye, in alpha how much of what lies behind survives, and
+// the depth the march stopped at, which lets the full-size picture upsample it without halos.
+const CLOUDS = NOISE + TRACE + `
+uniform sampler2D uW; uniform vec3 uLight, uLightCol, uZen, uHor;
+layout(location=0) out vec4 o; layout(location=1) out vec4 oDepth;
+float cloudAt(vec3 p){
+  vec2 w = textureLod(uW, p.xz/N+.5, 0.).rg; float cover = w.x+.3*w.y, h = (p.y-BASE)/(TOP-BASE);   // rain cloud is thicker
+  // Each cloud is a few heaps of uneven height. The octaves are rotated against each other and
+  // against the grid, or thresholded value noise shows its square lattice.
+  vec2 q = mat2(.8, .6, -.6, .8)*p.xz*.03+vec2(uTime*.08, 0.), r = OCT*q+p.y*.11;
+  float heap = .62*noise(q)+.38*noise(r);
+  float puff = cover+.8*(heap-.5)+.32*(noise(OCT*r-uTime*.12)-.5)+.14*(noise(OCT*OCT*r+p.y*.2)-.5);
+  return smoothstep(.4, .75, puff-1.25*h/(.3+heap))*smoothstep(0., .12, h)*(1.-smoothstep(.7, 1., h));
+}
+void main(){
+  vec3 ro = uRo, rd = viewRay();
+  float tEnd; if(!scene(ro, rd, tEnd)) tEnd = 1e5;
+  vec3 a = (vec3(-.5*N, 0, -.5*N)-ro)/rd, b = (vec3(.5*N, TOP, .5*N)-ro)/rd, mn = min(a,b), mx = max(a,b);
+  float t = max(max(mn.x, mn.y), max(mn.z, 0.)), t1 = min(min(mx.x, mx.y), min(mx.z, tEnd));
+  o = vec4(0, 0, 0, 1); oDepth = vec4(tEnd);
+  // Interleaved gradient noise (Jimenez) offsets each ray's first step.
+  t += 3.5*fract(52.98*fract(dot(gl_FragCoord.xy, vec2(.0671, .00584))));
+  vec3 sunlit = uLightCol*(.15+.45*pow(max(dot(rd, uLight), 0.), 5.)), skylit = uZen*.45+uHor*.4+uLightCol*.02;
+  for(int i=0; i<90 && t<t1 && o.a>.02; i++){
+    vec3 p = ro+rd*t; vec2 w = textureLod(uW, p.xz/N+.5, 0.).rg;
+    float h = (p.y-BASE)/(TOP-BASE), dt = w.x<.1 ? 14. : h>0. ? 3.5 : 7.;   // stride through clear air
+    t += dt;
+    if(w.x<.1) continue;
+    float dens, shade;
+    if(h>0.){
+      dens = .1*cloudAt(p);
+      if(dens<=0.) continue;
+      shade = mix(.18, 1., exp(-2.2*cloudAt(p+uLight*9.)-1.1*cloudAt(p+uLight*24.)));   // two taps toward the light
+    } else { dens = .0045*w.y*(.4+.6*noise(p.xz*.2+uTime*vec2(.6,.3)))*smoothstep(0., .2, -h); shade = .1; }                 // rain under the base
+    float alpha = 1.-exp(-dens*dt);
+    o.rgb += o.a*alpha*(sunlit*shade+skylit*(.25+.75*clamp(h+.1, 0., 1.))+flash(p.xz)*.55);
+    o.a *= 1.-alpha;
+  }
 }`;
 
 const POST = {};
@@ -472,7 +545,7 @@ function target(...textures) {      // a framebuffer drawing into one or more sa
   gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
   textures.forEach((t, i) => gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0 + i, gl.TEXTURE_2D, t, 0));
   gl.drawBuffers(textures.map((_, i) => gl.COLOR_ATTACHMENT0 + i));
-  return { fbo, w: textures[0].w, h: textures[0].h, tex: textures[0] };
+  return { fbo, w: textures[0].w, h: textures[0].h, tex: textures[0], textures };
 }
 // Run a fragment program over a target. Uniform kinds are inferred from the values passed.
 function draw(prog, to, uniforms) {
@@ -492,7 +565,7 @@ function draw(prog, to, uniforms) {
 
 const P = {};
 for (const k in SIM) P[k] = program(SIM[k]);
-P.render = program(RENDER);
+P.render = program(RENDER); P.clouds = program(CLOUDS);
 for (const k in POST) P[k] = program(POST[k]);
 
 // Simulation state wants full floats (erosion adds very small numbers to large ones).
@@ -505,6 +578,10 @@ const MIPS = Math.log2(N) + 1;
 const D0 = texture(N, N, gl.RGBA16F, gl.LINEAR, MIPS), D1 = texture(N, N, gl.RGBA16F, gl.LINEAR), D2 = texture(N, N, gl.RGBA16F, gl.LINEAR);
 const toDerived = target(D0, D1, D2), toShadow = target(texture(N, N, gl.RGBA8, gl.LINEAR));
 const toPick = target(texture(2, 1, SIMF, gl.NEAREST));
+const toWeather = target(texture(256, 256, gl.RGBA8, gl.LINEAR, 9));
+const toForecast = { fbo: gl.createFramebuffer() };   // the weather map's 16×16 mip: a forecast the CPU can afford to read
+gl.bindFramebuffer(gl.FRAMEBUFFER, toForecast.fbo);
+gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, toWeather.tex, 4);
 const toStats = { fbo: gl.createFramebuffer() };      // the 1×1 top of D0's mip chain is the world's average
 gl.bindFramebuffer(gl.FRAMEBUFFER, toStats.fbo);
 gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, D0, MIPS - 1);
@@ -513,7 +590,8 @@ gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, D0,
 let seed = parseInt(location.hash.slice(1), 36);
 if (!(seed > 0)) seed = 1 + Math.floor(Math.random() * 36 ** 4);
 let seedVec, time = 0, started = false, idle = 0;
-const world = { h: 0, water: 0, veg: 0, speed: 0, meanH: -3, meanVeg: 0, meanSpeed: 0 };   // read back from the GPU
+const world = { h: 0, water: 0, veg: 0, speed: 0, meanH: -3, meanVeg: 0, meanSpeed: 0, rain: 0 };   // read back from the GPU
+const storm = { x: 0, z: 0, flash: 0, again: 0, cell: -1 };
 const brush = { x: 0, z: 0, tx: 0, tz: 0, s: 0, radius: 20, glow: 0 };
 const cam = { az: 0, el: .2, dist: 590, azT: 0, elT: .2, distT: 590, drift: 1 };
 const sun = { phase: -.45, light: [0, 1, 0] };        // phase −0.45 is early golden hour, sun rising
@@ -539,12 +617,14 @@ function simulate(dt) {
   for (let i = 0; i < steps; i++) {
     draw(P.flux, fluxes[1], { uS: stateA, uF: fluxes[0].tex }); fluxes.reverse();
     draw(P.flow, toFlow, { uS: stateA, uF: fluxes[0].tex });
-    draw(P.erode, toStateA, { ...common, uS: stateB, uV: velocity, uRain: .0045,
+    draw(P.erode, toStateA, { ...common, uS: stateB, uV: velocity, uW: toWeather.tex, uRain: .006,
       uBrush: [brush.x, brush.z, brush.radius, brush.s * .14] });
   }
   draw(P.derive, toDerived, { uS: stateA, uV: velocity });
   gl.bindTexture(gl.TEXTURE_2D, D0); gl.generateMipmap(gl.TEXTURE_2D);
   draw(P.shadow, toShadow, { uD0: D0, uLight: sun.light });
+  draw(P.weather, toWeather, { ...common, uD0: D0 });
+  gl.bindTexture(gl.TEXTURE_2D, toWeather.tex); gl.generateMipmap(gl.TEXTURE_2D);
 }
 
 // ───────────────────────────────────────────────────────────── sky and light
@@ -666,7 +746,7 @@ function haunt(dt) {
   return ghost.sign;
 }
 
-const pickBuf = new Float32Array(8), statBuf = new Float32Array(4);
+const pickBuf = new Float32Array(8), statBuf = new Float32Array(4), forecast = new Uint8Array(1024);
 let frameCount = 0;
 function updateBrush(dt) {
   // Ask the GPU where the pointer's ray lands and what lies under the brush.
@@ -679,6 +759,12 @@ function updateBrush(dt) {
     gl.bindFramebuffer(gl.FRAMEBUFFER, toStats.fbo);
     gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.FLOAT, statBuf);
     Object.assign(world, { meanH: statBuf[0], meanVeg: statBuf[2], meanSpeed: statBuf[3] });
+    gl.bindFramebuffer(gl.FRAMEBUFFER, toForecast.fbo);
+    gl.readPixels(0, 0, 16, 16, gl.RGBA, gl.UNSIGNED_BYTE, forecast);
+    let rain = 0, worst = 0;
+    for (let i = 0; i < 256; i++) { const r = forecast[i * 4 + 1]; rain += r; if (r > worst) { worst = r; storm.cell = i; } }
+    world.rain = rain / 65280;
+    if (worst < 110) storm.cell = -1;            // no cloud heavy enough to strike from
   }
 
   if (gesture === 'pending') {
@@ -704,6 +790,17 @@ function updateBrush(dt) {
   brush.radius = 9 + cam.dist * .021;            // zoom in for finer work
 }
 
+// Lightning strikes from the heaviest rain cell, flickers twice, and is heard after a delay.
+function updateStorm(dt) {
+  storm.flash *= Math.exp(-dt * 8);
+  if (storm.again && time > storm.again) { storm.flash = .8; storm.again = 0; }
+  if (storm.cell < 0 || Math.random() > dt * .14) return;
+  storm.x = ((storm.cell % 16 + Math.random()) / 16 - .5) * N;
+  storm.z = (((storm.cell >> 4) + Math.random()) / 16 - .5) * N;
+  storm.flash = 1; storm.again = time + .08 + .1 * Math.random();
+  thunder(Math.hypot(storm.x - cam.pos[0], storm.z - cam.pos[2]));
+}
+
 // ───────────────────────────────────────────────────────────── adaptive resolution
 // The picture is rendered at a fraction of the canvas and scaled so that frames never drop.
 const view = { scale: 0, ema: 1 / 60, timer: 0, calm: 0, ceiling: 1 };
@@ -714,12 +811,13 @@ function resize() {
   buildTargets();
 }
 function buildTargets() {
-  for (const t of view.targets || []) { gl.deleteTexture(t.tex); gl.deleteFramebuffer(t.fbo); }
+  for (const t of view.targets || []) { t.textures.forEach(x => gl.deleteTexture(x)); gl.deleteFramebuffer(t.fbo); }
   const w = Math.max(2, Math.round(canvas.width * view.scale)), h = Math.max(2, Math.round(canvas.height * view.scale));
   view.scene = target(texture(w, h, gl.RGBA16F, gl.LINEAR));
   view.ldr = target(texture(w, h, gl.RGBA8, gl.LINEAR));
   view.bloom = [1, 2, 3, 4, 5].map(i => target(texture(Math.max(1, w >> i), Math.max(1, h >> i), gl.RGBA16F, gl.LINEAR)));
-  view.targets = [view.scene, view.ldr, ...view.bloom];
+  view.clouds = target(texture(Math.ceil(w / 3), Math.ceil(h / 3), gl.RGBA16F, gl.NEAREST), texture(Math.ceil(w / 3), Math.ceil(h / 3), gl.RGBA16F, gl.NEAREST));
+  view.targets = [view.scene, view.ldr, view.clouds, ...view.bloom];
 }
 function adapt(dt) {
   if (dt > .1) return;                           // a hitch or a tab switch says nothing about the GPU
@@ -736,12 +834,13 @@ function adapt(dt) {
 addEventListener('resize', resize);
 
 function render() {
-  const { scene, ldr, bloom } = view, res = [scene.w, scene.h];
+  const { scene, ldr, bloom, clouds } = view, res = [scene.w, scene.h];
+  const shared = { uSeed: seedVec, uTime: time, uD0: D0, uW: toWeather.tex, uRo: cam.pos, uCr: cam.r, uCu: cam.u, uCf: cam.f,
+    uLight: sun.light, uLightCol: sun.lightCol, uZen: sun.zen, uHor: sun.hor, uFlash: [storm.x, storm.z, storm.flash] };
+  draw(P.clouds, clouds, { ...shared, uRes: [clouds.w, clouds.h] });
   draw(P.render, scene, {
-    uSeed: seedVec, uTime: time, uD0: D0, uD1: D1, uD2: D2, uSh: toShadow.tex, uRes: res,
-    uRo: cam.pos, uCr: cam.r, uCu: cam.u, uCf: cam.f,
-    uLight: sun.light, uLightCol: sun.lightCol, uSunDir: sun.dir, uSunCol: sun.col, uMoonDir: MOON,
-    uGlow: sun.glow, uZen: sun.zen, uHor: sun.hor, uStars: sun.night, uFog: sun.fog,
+    ...shared, uD1: D1, uD2: D2, uSh: toShadow.tex, uClouds: clouds.tex, uCloudDepth: clouds.textures[1], uRes: res, uSunDir: sun.dir, uSunCol: sun.col, uMoonDir: MOON,
+    uGlow: sun.glow, uStars: sun.night, uFog: sun.fog,
     uReflect: view.scale > .45 ? 1 : 0,
     uBrush: [brush.x, brush.z, brush.radius, brush.glow * .55],
   });
@@ -792,6 +891,7 @@ function startAudio() {
   };
   audio.sea = layer('lowpass', 400, .4); audio.wind = layer('bandpass', 650, .7);
   audio.water = layer('bandpass', 2600, .6); audio.rumble = layer('lowpass', 85, 1.5);
+  audio.rain = layer('highpass', 3800, .3); audio.hiss = hiss;
 
   const voice = (type, freq, gain, dest) => {
     const o = ac.createOscillator(), g = ac.createGain();
@@ -820,6 +920,15 @@ function pluck(freq, level, pan, decay) {      // a bell: a sine and one inharmo
     o.connect(g).connect(p); o.start(t); o.stop(t + dur);
   });
 }
+function thunder(distance) {      // a crack that darkens into a rumble, late by the distance it travelled
+  const { ac, out, verb, hiss } = audio; if (!ac) return;
+  const t = ac.currentTime + distance / 700, src = ac.createBufferSource(), f = ac.createBiquadFilter(), g = ac.createGain();
+  src.buffer = hiss; src.playbackRate.value = .45;
+  f.frequency.setValueAtTime(1100, t); f.frequency.exponentialRampToValueAtTime(60, t + 2.8);
+  g.gain.setValueAtTime(0, t); g.gain.linearRampToValueAtTime(.55, t + .03); g.gain.exponentialRampToValueAtTime(1e-3, t + 3.4);
+  src.connect(f).connect(g); g.connect(out); g.connect(verb);
+  src.start(t, Math.random()); src.stop(t + 3.5);
+}
 function chirp() {
   const { ac, verb, out } = audio, base = 2300 + 2600 * Math.random(), n = 2 + Math.floor(Math.random() * 4);
   let t = ac.currentTime;
@@ -841,6 +950,7 @@ function updateAudio(dt) {
   to(a.wind.g, .01 + .03 * smooth(300, 1100, cam.dist) + .012 * Math.sin(time * .23), .4);
   to(a.wind.f, 560 + 260 * Math.sin(time * .11), .5);
   to(a.water.g, Math.min(.1, world.meanSpeed * 2.2 + world.speed * world.water * .08), .25);
+  to(a.rain.g, Math.min(.07, world.rain * 1.5), .6);
   to(a.rumble.g, s * .75); to(a.sub.g, s * .2);
   to(a.sub.f, 38 + 10 * s + 3 * Math.sin(time * 9));
 
@@ -860,7 +970,7 @@ function updateAudio(dt) {
     if (Math.random() < .6) pluck(a.root * 2 ** ((chord[2 + (Math.random() < .5)] + 12) / 12), .018, Math.random() - .5, 5);
   }
   to(a.padFilter.frequency, 260 + 520 * day + 300 * s, 1);
-  if (Math.random() < dt * Math.min(world.meanVeg * 14, 1.6) * day) chirp();
+  if (Math.random() < dt * Math.min(world.meanVeg * 14, 1.6) * day * (1 - Math.min(world.rain * 12, .9))) chirp();   // birds shelter from rain
 }
 
 // ───────────────────────────────────────────────────────────── main loop
@@ -873,6 +983,7 @@ function frame(now) {
   updateCamera(dt);
   simulate(dt);
   updateBrush(dt);
+  updateStorm(dt);
   render();
   updateAudio(dt);
   requestAnimationFrame(frame);
