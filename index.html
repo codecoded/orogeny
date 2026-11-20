@@ -325,14 +325,14 @@ void main(){
 
   // Talus: material slides to any neighbour it overhangs by more than the angle of repose.
   // All eight neighbours take part (with four, cones come out as pyramids), each at its true distance.
-  float talus = mix(.45, 1.6, hard*hard)*(d>.25 ? .6 : 1.);
+  float grit = noise(n*R*.3+uSeed.yzx), talus = mix(.45, 1.6, hard*hard)*(d>.25 ? .6 : 1.)*(.7+.6*grit);   // no two screes lie at quite the same angle
   #define SLIP(h, run) (sign(h-b)*max(abs(h-b)-talus*run, 0.))
   b += .07*(SLIP(l.x, len.x)+SLIP(r.x, len.x)+SLIP(u.x, len.y)+SLIP(dn.x, len.y))
      + .05*(SLIP(diag.x, len.z)+SLIP(diag.y, len.z)+SLIP(diag.z, len.w)+SLIP(diag.w, len.w));
 
   // The viewer's hand. Uplift follows ridged noise so that land rises as ranges, not bells.
   float g = exp(-2.*R*R*(1.-dot(n, uBrush.xyz))/(uBrushR*uBrushR))*uBrush.w;
-  b += g>0. ? g*(.13+1.9*rock.y)*(1.-smoothstep(36., 52., b)) : g*(.6+.8*rock.w)*smoothstep(-14., -10., b);
+  b += g>0. ? g*(.13+1.9*rock.y)*(.5+grit)*(1.-smoothstep(36., 52., b)) : g*(.6+.8*rock.w)*smoothstep(-14., -10., b);
   veg *= 1.-min(abs(g)*2., 1.);
   if(uTick>0.){                                      // the lava pass is about to freeze some of its flow: here it becomes ground
     vec4 lava = texelFetch(uL, p, 0);
@@ -372,7 +372,9 @@ void main(){
     float gone = spill(l, s-sk, run), come = spill(m, sk-s, run);
     depth += come-gone; heat += come*m.y-gone*l.y;
   }
-  float vent = exp(-6.*R*R*(1.-dot(n, uBrush.xyz))/(uBrushR*uBrushR))*uBrush.w*smoothstep(.4, .75, texelFetch(uRock, p, 0).y);   // fissures along the crests, near the middle of the push
+  // A broad push opens fissures along the crests it raises; a narrow one, a single vent at its middle.
+  float reach = max(uBrushR, 6.), crest = smoothstep(.4, .75, texelFetch(uRock, p, 0).y);
+  float vent = exp(-6.*R*R*(1.-dot(n, uBrush.xyz))/(reach*reach))*uBrush.w*mix(1., crest, smoothstep(8., 20., uBrushR));
   depth += vent; heat += vent;
   float quench = .0007+.05*smoothstep(.1, .6, texelFetch(uS, p, 0).y)+.003*textureLod(uW, gut(n, NW), 0.).g;   // air, sea, rain
   o = vec4(depth, depth>1e-4 ? clamp(heat/depth-uTick*quench/(.25+depth), 0., 1.) : 0., depth>.15 ? uStamp : l.z, 0.);
@@ -477,6 +479,7 @@ void main(){
   float belt = exp(-51.*n.y*n.y)-.8*exp(-51.*(abs(n.y)-.47)*(abs(n.y)-.47)); // air rises at the equator and sinks in the horse latitudes
   float slope = .03*max(rise, 0.)*speed, lift = .5*belt+1.6*storm+.3*(1.-smoothstep(-.2, .3, T))+.6*fire;
   float cover = max(smoothstep(.66, 1.1, q+3.*(grain-.5)+.4*lift+.15*slope), .7*smoothstep(.25, 1., ash*(.4+1.2*grain)));
+  cover *= 1.-.9*smoothstep(.03, .3, fire);                                  // …but right over the fire the heat keeps the air clear
   float rain = clamp(smoothstep(.5, .95, cover)*q*(1.+2.*lift)+.5*q*min(slope, 1.)*smoothstep(.1, .5, cover), 0., 1.);
   o = vec4(cover, rain, clamp(q-uDt*1.2*rain*q, 0., 1.), ash);
 }`;
@@ -633,7 +636,7 @@ void main(){
 
 const RENDER = TRACE + SKY + `
 uniform sampler2D uD1, uD2, uD3, uSh, uW, uAir, uAirPass, uG;
-uniform vec4 uBrush, uCraft[10]; uniform float uBrushR, uBase; uniform vec2 uTurn;
+uniform vec4 uBrush, uCraft[10]; uniform float uBrushR, uBase, uPart; uniform vec2 uTurn;
 out vec4 o;
 vec3 tangent(vec3 v, vec3 up){ return v-up*dot(v, up); }   // the part of v that lies along the ground
 
@@ -670,6 +673,17 @@ vec2 streets(vec3 g, vec3 up, float e, float lit){
   vec3 line = use*(1.-smoothstep(.035, .035+e, d))*(.4+.6*vec3(hash(id.xxx), hash(id.yyy+3.), hash(id.zzz+5.)));   // some streets are grander than others
   return vec2(lamp*.0081/(r*r), max(line.x, max(line.y, line.z))*.07/(.07+e));   // a lamp smaller than a pixel gets dimmer, not smaller
 }
+// Cracked ice: a scatter of points, one to a grid cell, and the nearest two of them. Returns how
+// far it is to the crack that runs between those two, and a number for the plate we are on.
+vec2 plates(vec3 g){
+  vec3 base = floor(g-.5); float d1 = 9., d2 = 9., id = 0.;
+  for(int k=0;k<8;k++){
+    vec3 c = base+vec3(k&1, (k>>1)&1, k>>2), r = c+.5+.5*(vec3(hash(c+1.7), hash(c+5.3), hash(c+9.1))-.5)-g;
+    float dd = dot(r, r);
+    if(dd<d1){ d2 = d1; d1 = dd; id = hash(c); } else d2 = min(d2, dd);
+  }
+  return vec2(.5*(sqrt(d2)-sqrt(d1)), id);
+}
 // The road itself. Every cell on a route knows which neighbour its travellers make for, so a
 // route is a chain of straight pieces from cell to cell. Returns how far off the nearest piece
 // is, how far along it we are, and how many pass.
@@ -692,7 +706,7 @@ vec3 shade(vec3 p, vec3 rd, float t){
        f = textureLod(uD2, uv, 0.), life = soft(uD3, uv, zoom);
   // Thin sheets of rain run downhill in pulses a cell wide; averaged over 2×2 cells (the next
   // mip) they are an even film. Rivers, lakes and sea keep their own depth.
-  float film = textureLod(uD0, uv, 1.).y, d = mix(film, c.y, smoothstep(.1, .3, film));
+  float film = textureLod(uD0, uv, 1.).y, d = mix(c.y, mix(film, c.y, smoothstep(.1, .3, film)), smoothstep(.5, 1., c.x+c.y-uSea-tide(up)));   // (not at the shore: the average would notch the waterline)
   float b = c.x, veg = c.z, h = b-uSea, mu = dot(up, uSun), T = temperature(up, b);
   vec3 nrm = normalize(g.xyz);
   float flatness = dot(nrm, up), slope = sqrt(max(1.-flatness*flatness, 0.))/max(flatness, .2)/ZS, steep = smoothstep(.5, 1., slope);
@@ -726,8 +740,8 @@ vec3 shade(vec3 p, vec3 rd, float t){
   alb = mix(alb, leaf, canopy);
   float molten = life.z, basalt = life.w;
   alb = mix(alb, vec3(.045, .04, .042)*(.5+n2.x), basalt);
-  float snow = smoothstep(.05, .5, f.w+.3*(n1.x-.5)*step(.01, f.w))*(1.-basalt);
-  alb = mix(alb, vec3(.8, .85, .92), snow);
+  float snow = smoothstep(.05, .5, f.w+.3*(n1.x-.5)*step(.01, f.w))*(1.-basalt)*(1.-.9*smoothstep(.7, 1.3, slope+.6*(n2.x-.5)));   // none clings to a cliff
+  alb = mix(alb, vec3(.56, .6, .67), snow);          // dimmer than snow is, so that its slopes still shade
   // Where people live. From far off: a wash of farmland, a band along each road. Up close a town
   // has a plan at two scales, avenues about a cell apart and streets between them, laid out at a
   // different angle in each district; fields fill the blocks that houses do not; and a road is a line.
@@ -753,18 +767,32 @@ vec3 shade(vec3 p, vec3 rd, float t){
   // Fine relief: rock grain and gullies, a bumpy canopy where it is wooded, dunes on open sand.
   float bare = (1.-canopy)*(1.-snow), rocky = bare*max(max(steep, .5*cold), basalt), sandy = bare*arid*(1.-steep)*smoothstep(.3, 1.5, h);
   vec4 bumps = w2*.45*mix(.4+.4*steep, 1.6, canopy)*relief(n2, rocky)+w3*.4*mix(.5+.5*steep, 1.3, canopy)*relief(n3, rocky)+w4*.3*relief(n4, rocky);
-  if(sandy>.02 && w2>0.){
+  float drift = max(sandy*smoothstep(.2, .6, noise(p*.05+uSeed)), snow*(1.-steep));   // the wind makes dunes of sand, and of snow
+  if(drift>.02 && w2>0.){
     vec4 dune = noised(p*vec3(.45, 1.5, .45)+uSeed.zxy+1.6*n1.x);   // stretched, so its crests run in lines; warped, so they wander
-    bumps = mix(bumps, bumps*.4+.7*w2*vec4(sign(dune.x-.5)*dune.yzw*vec3(.3, 1., .3), abs(2.*dune.x-1.)-.5), sandy*smoothstep(.2, .6, noise(p*.05+uSeed)));
+    bumps = mix(bumps, bumps*.4+.7*w2*vec4(sign(dune.x-.5)*dune.yzw*vec3(.3, 1., .3), abs(2.*dune.x-1.)-.5), drift);
   }
   alb *= 1.-.7*bumps.w*(1.-.7*snow);
-  vec3 n = normalize(up+tangent(nrm, up)*.6/ZS+tangent(n1.yzw, up)*.3*(1.-.6*canopy)*(1.-.5*sandy)+tangent(bumps.xyz, up)*(1.-.8*snow));   // slopes exaggerated, as on a relief map
+  vec3 n = normalize(up+tangent(nrm, up)*.6/ZS+tangent(n1.yzw, up)*.3*(1.-.6*canopy)*(1.-.5*sandy)+tangent(bumps.xyz, up)*(1.-.3*snow));   // slopes exaggerated, as on a relief map
   vec3 col = alb*(sun*max(dot(n, uSun), 0.)+ambient+flashes(up, 3000.))+mix(vec3(dot(alb, vec3(.3, .5, .2))), alb, .3)*moonlight*max(dot(n, md), 0.);   // by moonlight the eye loses colour
   if(molten>.003){
-    // Lava gives its own light. As it cools a crust closes over it, and the glow retreats into the cracks.
-    float plate = mix(noise(OCT*p*.8+1.3*n2.yzw), n3.x, .35*w3), seam = 1.-smoothstep(0., .03+.05*molten, abs(plate-.62));
-    float open = max(smoothstep(-.12, .12, .95*molten-.25-1.25*plate), seam*smoothstep(.1, .3, molten));
-    col = col*(1.-.85*smoothstep(0., .2, molten))+(vec3(1., .26, .03)*pow(molten, 1.5)+vec3(.45, .3, .1)*pow(molten, 5.))*(3.2-1.8*plate)*open;
+    // Lava gives its own light. A crust closes over it in plates, with the glow in the cracks
+    // between them, wider where the flow is hotter. The plates ride downhill in two half-offset
+    // phases, like the foam on a river.
+    float crisp = 1.-smoothstep(.3, .8, px), ph = fract(uTime*.2), heat = 0., total = 0.;
+    vec3 creep = tangent(nrm, up)*5.*molten, q = p*.6+.5*n1.yzw+.08*n2.yzw;
+    for(int k=0; k<2 && crisp>0.; k++){
+      float f = fract(ph+.5*float(k)), wt = smoothstep(.3, .7, 1.-abs(2.*f-1.));   // one set of plates at a time, with a quick dissolve between
+      if(wt<=0.) continue;
+      vec2 pl = plates(q-creep*f+7.*float(k)); float wide = .015+.07*molten*(.4+1.2*pl.y);
+      heat += wt*(1.-.7*smoothstep(0., wide, pl.x))*(1.-smoothstep(.7*wide, wide+.01+1.5*px, pl.x)); total += wt;
+    }
+    heat = mix(.3, heat*(.55+.9*noise(p*1.1+uTime*.3))/max(total, 1e-3), crisp);
+    heat = max(heat, smoothstep(.8, 1., molten)*(.4+.6*n2.x));                       // at the vent itself no crust has formed yet
+    // The same again a dozen times larger, which is what is left of it from orbit: a dark shield veined with fire.
+    vec2 big = plates(p*14./R+uSeed+.07*n1.yzw); float vein = .02+.05*molten;
+    heat = molten*max(heat, (.75+.25*sin(uTime*.7+9.*big.y))*(1.-smoothstep(.5*vein, vein+21.*px/R, big.x)));
+    col = col*(1.-.8*smoothstep(0., .15, molten))+vec3(2.6, .42, .03)*heat*heat+vec3(.7, .55, .12)*pow(heat, 7.);
   }
 
   float wet = smoothstep(.008, .06, d);
@@ -794,12 +822,23 @@ vec3 shade(vec3 p, vec3 rd, float t){
     float ph = fract(uTime*.4); vec3 fl = f.xyz*9.;
     float fn = mix(noise(p*1.4-fl*ph), noise(p*1.4-fl*fract(ph+.5)+5.), abs(1.-2.*ph));
     float rapids = .6*smoothstep(.6, 1.2, c.w)*(1.-smoothstep(.3, 2., d))*smoothstep(.12, .3, d);
-    float shore = step(h+d-tide(up), .6), surf = (1.-smoothstep(.03, .35, d))*shore*(.5+.45*sin(uTime*1.1+6.*noise(p*.06)+d*9.));
-    float foam = smoothstep(.55, .9, .5*fn+max(max(rapids, surf), (.2+fn)*smoothstep(.02, .3, textureLod(uD3, uv, 1.).z)));   // and steam where lava meets the sea
+    float shore = 1.-smoothstep(.4, .8, h+d-tide(up)), surf = (1.-smoothstep(.03, .35, d))*shore*(.5+.45*sin(uTime*1.1+6.*noise(p*.06)+d*9.));
+    float foam = smoothstep(.55, .9, .5*fn+max(rapids, surf));
     w = mix(w, vec3(.8, .84, .86)*(inLight+sun*.15), foam*.9);
+    if(molten>.005){                                  // where lava meets the sea, steam boils off in billows, lit from beneath
+      float puff = noise(p*.5+uTime*vec3(.4, .25, -.3))*noise(p*1.4-uTime*vec3(.25, .5, .3));
+      w = mix(w, vec3(.85, .87, .9)*(inLight+sun*.2)+vec3(1., .3, .06)*molten, .8*smoothstep(.005, .3, molten)*smoothstep(.03, .4, puff));
+    }
     w += night*vec3(.01, .12, .15)*(foam+.3*smoothstep(.15, .6, c.w)*fn)*(.1+.9*shore)*smoothstep(.55, .75, noise(p*.04+uTime*.02));   // on some nights, in some bays, disturbed water glows
-    float floe = shore*(1.-smoothstep(-.24, -.04, T+.3*(.6*noise(p*.05)+.4*noise(p*.16)-.5)));   // pack ice on cold seas
-    w = mix(w, vec3(.78, .84, .9)*(sun*max(mu, 0.)+ambient), floe);
+    // Pack ice on cold seas: plates, cracked across, with dark leads that widen toward the margin until the pack is loose floes.
+    float cover = shore*(1.-smoothstep(-.24, -.04, T+.3*(.6*noise(p*.05)+.4*noise(p*.16)-.5)));
+    if(cover>0.){
+      float fine = 1.-smoothstep(.15, .4, px*.5), finer = 1.-smoothstep(.15, .4, px*2.), lead = .25*(1.-cover)*(1.-cover); vec2 big = vec2(1., .5), small = big;
+      if(fine>0.) big = plates(p*.5+uSeed);
+      if(finer>0.) small = plates(p*2.+7.);
+      float floe = cover*mix(1., step(big.y, 1.6*cover)*smoothstep(lead, lead+.04+px, big.x), fine)*mix(1., smoothstep(0., .05+2.*px, small.x), .7*finer);
+      w = mix(w, vec3(.56, .61, .68)*(.8+.25*big.y*fine+.15*small.y*finer)*(sun*max(mu, 0.)+ambient), floe);
+    }
     col = mix(col, w, wet);
   }
   // Fires, then towns: points of light wherever people have settled, on the night side. Where
@@ -835,7 +874,7 @@ vec4 clouds(vec3 ro, vec3 rd, float tEnd){
   vec3 entry = normalize(ro+rd*outer.x), sunward = normalize(tangent(uSun, entry)+1e-4);
   for(float i=.5; i<4.; i++){
     vec3 p = ro+rd*(outer.x+i*dt); float r = length(p); vec3 dir = p/r; vec4 sky = textureLod(uW, gut(dir, NW), 0.);
-    float h = (r-RC)/TC, cover = sky.r;
+    float h = (r-RC)/TC, cover = sky.r*(1.-uPart*exp(-.6*R*R*(1.-dot(dir, uBrush.xyz))/(uBrushR*uBrushR)));   // the hand parts the clouds it works under
     if(cover<.03) continue;
     vec4 heap = vec4(.5, 0, 0, 0);                   // up close the cover breaks into heaps: noise, with its gradient for shading
     if(fine>0.){
@@ -1339,7 +1378,7 @@ function updateBrush(dt) {
   brush.s += (want - brush.s) * ease(dt, Math.abs(want) > Math.abs(brush.s) ? .14 : .32);
   brush.glow += (Math.max(glow, Math.abs(brush.s)) - brush.glow) * ease(dt, .2);
   // The brush covers the same share of the picture at any height, so descending means finer work.
-  brush.radius = Math.max(5, .22 * look.range * cam.tanV * Math.min(1, canvas.width / canvas.height));
+  brush.radius = Math.max(6, .22 * look.range * cam.tanV * Math.min(1, canvas.width / canvas.height));
 }
 
 // ───────────────────────────────────────────────────────────── adaptive quality
@@ -1384,7 +1423,7 @@ function render() {
     uTurn: [Math.cos(moon.angle), Math.sin(moon.angle)], uBase: moon.base };
   draw(P.air, air, { ...shared, uRes: [air.w, air.h] });
   draw(P.render, scene, { ...shared, uD1: D[1], uD2: D[2], uD3: D[3], uSh: toShadow.tex, uG: lives[0].textures[1], uAir: air.tex, uAirPass: air.textures[1],
-    uRes: res, uBrush: [...brush.dir, brush.glow * .55], uBrushR: brush.radius, uCraft: craftData });
+    uRes: res, uBrush: [...brush.dir, brush.glow * .55], uBrushR: brush.radius, uPart: Math.min(1, 1.5 * Math.abs(brush.s)), uCraft: craftData });
   // Bloom: threshold, walk down a pyramid, then add each level back into the one above.
   let src = scene;
   bloom.forEach((b, i) => { draw(P.blur, b, { uT: src.tex, uRes: [b.w, b.h], uSpread: .5, uKnee: i ? 0 : 1.1 }); src = b; });
